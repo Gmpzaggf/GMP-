@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Sequence, Tuple
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -26,9 +27,15 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
 
 # =====================================================================
-# 🛠 1. КОНФИГУРАЦИЯ (Считываем из Environment Variables)
+# 🛠 1. КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
+
+# Настройки GitHub API
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 admin_id_raw = os.getenv("ADMIN_IDS", "123456789")
 ADMIN_IDS = [int(x.strip()) for x in admin_id_raw.split(",") if x.strip().isdigit()]
@@ -56,12 +63,6 @@ class WithdrawalStatus(str, enum.Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
 
-class TransactionType(str, enum.Enum):
-    TASK_REWARD = "task_reward"
-    WITHDRAWAL_LOCK = "withdrawal_lock"
-    WITHDRAWAL_FINAL = "withdrawal_final"
-    WITHDRAWAL_REFUND = "withdrawal_refund"
-
 class User(Base):
     __tablename__ = "users"
 
@@ -74,7 +75,6 @@ class User(Base):
 
     submissions: Mapped[list["TaskSubmission"]] = relationship(back_populates="user")
     withdrawals: Mapped[list["Withdrawal"]] = relationship(back_populates="user")
-    transactions: Mapped[list["Transaction"]] = relationship(back_populates="user")
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -82,7 +82,6 @@ class Task(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    instructions: Mapped[str] = mapped_column(Text, nullable=False)
     reward_gmp: Mapped[int] = mapped_column(Integer, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
@@ -101,7 +100,7 @@ class TaskSubmission(Base):
     proof_data: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    user: Mapped["User"] = relationship(back_populates="user")
+    user: Mapped["User"] = relationship(back_populates="submissions")
     task: Mapped["Task"] = relationship(back_populates="submissions")
 
 class Withdrawal(Base):
@@ -117,18 +116,6 @@ class Withdrawal(Base):
 
     user: Mapped["User"] = relationship(back_populates="withdrawals")
 
-class Transaction(Base):
-    __tablename__ = "transactions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    type: Mapped[TransactionType] = mapped_column(SQLEnum(TransactionType), nullable=False)
-    amount_gmp: Mapped[int] = mapped_column(Integer, nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user: Mapped["User"] = relationship(back_populates="transactions")
-
 class Setting(Base):
     __tablename__ = "settings"
 
@@ -136,7 +123,7 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
 # =====================================================================
-# ⚙️ 3. РЕПОЗИТОРИЙ И БД
+# ⚙️ 3. ИНИЦИАЛИЗАЦИЯ И РЕПОЗИТОРИЙ БД
 # =====================================================================
 engine = create_async_engine(DB_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -258,7 +245,6 @@ class Repository:
             return True, "Вывод одобрен.", wth
 
     async def cleanup_old_data(self):
-        """ Очистка старых записей старше 30 дней для экономии места """
         async with self.session.begin():
             cutoff = datetime.utcnow() - timedelta(days=30)
             await self.session.execute(
@@ -269,33 +255,50 @@ class Repository:
             )
 
 # =====================================================================
-# 🔄 4. ФОНОВЫЕ ЗАДАЧИ (Авто-ринг + Авто-чистка)
+# 🔄 4. ФОНОВЫЕ ЗАДАЧИ И GITHUB HELPER
 # =====================================================================
+async def fetch_github_file_info(file_path: str):
+    """ Вспомогательная функция для взаимодействия с GitHub API """
+    if not GITHUB_TOKEN:
+        return None
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
+
 async def auto_ring_loop(bot: Bot):
-    TARGET_URL = "https://httpbin.org/get"
+    """ Self-Ping для предотвращения засыпания Render Web Service """
+    target_url = os.getenv("RENDER_EXTERNAL_URL", "https://httpbin.org/get")
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(TARGET_URL, timeout=15) as response:
+                async with session.get(target_url, timeout=15) as response:
                     if response.status == 200:
-                        logging.info("✅ Авто-ринг успешен!")
+                        logging.info("✅ Self-Ping успешен!")
         except Exception as e:
-            logging.error(f"❌ Ошибка авто-ринга: {e}")
-        await asyncio.sleep(300)
+            logging.error(f"❌ Ошибка Self-Ping: {e}")
+        await asyncio.sleep(600)
 
 async def periodic_cleanup_loop():
+    """ Авто-очистка устаревших данных раз в 24 часа """
     while True:
         try:
             async with AsyncSessionLocal() as session:
                 repo = Repository(session)
                 await repo.cleanup_old_data()
-                logging.info("🧹 Кэш и старые данные автоматически очищены.")
+                logging.info("🧹 Авто-чистка БД завершена.")
         except Exception as e:
-            logging.error(f"❌ Ошибка при очистке БД: {e}")
-        await asyncio.sleep(86400) # Очистка раз в сутки
+            logging.error(f"❌ Ошибка очистки БД: {e}")
+        await asyncio.sleep(86400)
 
 # =====================================================================
-# 🔄 5. MIDDLEWARES & STATES
+# 🔄 5. MIDDLEWARE И FSM
 # =====================================================================
 class DbSessionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
@@ -336,14 +339,14 @@ def main_user_kb() -> ReplyKeyboardMarkup:
 def admin_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="⚙️ Изменить курс/лимиты", callback_data="admin_settings")],
+        [InlineKeyboardButton(text="⚙️ Настройки курса", callback_data="admin_settings")],
         [InlineKeyboardButton(text="➕ Создать задание", callback_data="admin_add_task")],
         [InlineKeyboardButton(text="📝 Проверка заданий", callback_data="admin_check_tasks")],
         [InlineKeyboardButton(text="💸 Заявки на вывод", callback_data="admin_withdraws_menu")]
     ])
 
 # =====================================================================
-# 🚀 7. ХЭНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ
+# 🚀 7. ХЭНДЛЕРЫ
 # =====================================================================
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -354,7 +357,7 @@ async def cmd_start(msg: Message, repo: Repository):
 
 @dp.message(F.text == "ℹ️ Помощь")
 async def cmd_help(msg: Message):
-    await msg.answer("ℹ️ Выполняйте задания, получай GMP и выводите GMP!")
+    await msg.answer("ℹ️ Выполняйте задания, получайте GMP и выводите средства!")
 
 @dp.message(F.text == "💰 Баланс")
 async def cmd_balance(msg: Message, repo: Repository):
@@ -363,7 +366,7 @@ async def cmd_balance(msg: Message, repo: Repository):
     await msg.answer(
         f"💰 **Ваш баланс:**\n\n"
         f"💳 Доступно: {user.balance_active} GMP (≈ {round(user.balance_active * rate, 2)} грн)\n"
-        f"🔒 В процессе вывода: {user.balance_locked} GMP",
+        f"🔒 На выводе: {user.balance_locked} GMP",
         parse_mode="Markdown"
     )
 
@@ -377,10 +380,11 @@ async def cmd_profile(msg: Message, repo: Repository, is_admin: bool):
         f"Статус: {role_str}\n"
         f"ID: `{user.telegram_id}`\n"
         f"Логин: @{user.username}\n"
+        f"Репозиторий: `{GITHUB_OWNER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n"
         f"Баланс: {user.balance_active} GMP"
     )
     if is_admin:
-        text += "\n\n💡 _Для входа в панель админа используйте /admin_"
+        text += "\n\n💡 _Панель администратора доступна по /admin_"
         
     await msg.answer(text, parse_mode="Markdown")
 
@@ -390,7 +394,7 @@ async def list_tasks(msg: Message, repo: Repository):
     user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
     tasks = await repo.get_available_tasks_for_user(user.id)
     if not tasks:
-        await msg.answer("🎉 Вы выполнили все доступные задания на сегодня!")
+        await msg.answer("🎉 Вы выполнили все доступные задания!")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -409,7 +413,7 @@ async def view_task(call: CallbackQuery, repo: Repository):
 async def start_task(call: CallbackQuery, state: FSMContext):
     await state.update_data(current_task_id=int(call.data.split(":")[1]))
     await state.set_state(TaskSubmissionFSM.waiting_for_proof)
-    await call.message.edit_text("📤 Отправьте **фото** или **текст** в качестве отчета:")
+    await call.message.edit_text("📤 Отправьте **фото** или **текст** с отчетом:")
 
 @dp.message(TaskSubmissionFSM.waiting_for_proof)
 async def process_proof(msg: Message, state: FSMContext, repo: Repository):
@@ -421,9 +425,9 @@ async def process_proof(msg: Message, state: FSMContext, repo: Repository):
     sub = await repo.create_submission(user.id, data["current_task_id"], proof_type, proof_data)
     await state.clear()
     if sub:
-        await msg.answer("⏳ **Отчет отправлен на проверку!**", parse_mode="Markdown")
+        await msg.answer("⏳ **Отчет успешно отправлен на проверку!**", parse_mode="Markdown")
     else:
-        await msg.answer("❌ Ошибка отправки отчета.")
+        await msg.answer("❌ Ошибка при отправке отчета.")
 
 # --- ВЫВОД ---
 @dp.message(F.text == "💸 Вывод GMP")
@@ -431,7 +435,7 @@ async def withdraw_start(msg: Message, repo: Repository, state: FSMContext):
     user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
     min_w = int(await repo.get_setting("min_withdraw", "500"))
     if user.balance_active < min_w:
-        await msg.answer(f"❌ Минимальный вывод: {min_w} GMP. На вашем балансе: {user.balance_active} GMP.")
+        await msg.answer(f"❌ Минимальный вывод: {min_w} GMP. Ваш баланс: {user.balance_active} GMP.")
         return
     await state.set_state(WithdrawFSM.waiting_for_amount)
     await msg.answer("💰 Введите сумму GMP для вывода:")
@@ -443,7 +447,7 @@ async def withdraw_amount(msg: Message, state: FSMContext):
         return
     await state.update_data(withdraw_amount=int(msg.text))
     await state.set_state(WithdrawFSM.waiting_for_requisites)
-    await msg.answer("💳 Введите номер вашей карты или кошелька:")
+    await msg.answer("💳 Введите ваши реквизиты:")
 
 @dp.message(WithdrawFSM.waiting_for_requisites)
 async def withdraw_reqs(msg: Message, state: FSMContext, repo: Repository):
@@ -452,7 +456,7 @@ async def withdraw_reqs(msg: Message, state: FSMContext, repo: Repository):
     ok, err, wth = await repo.create_withdrawal(user.id, data["withdraw_amount"], msg.text.strip())
     await state.clear()
     if ok:
-        await msg.answer(f"✅ Заявка на вывод #{wth.id} принята!")
+        await msg.answer(f"✅ Заявка на вывод #{wth.id} успешно создана!")
     else:
         await msg.answer(f"❌ Ошибка: {err}")
 
@@ -460,14 +464,12 @@ async def withdraw_reqs(msg: Message, state: FSMContext, repo: Repository):
 async def history(msg: Message, repo: Repository):
     user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
     subs = (await repo.session.execute(select(TaskSubmission).where(TaskSubmission.user_id == user.id).order_by(desc(TaskSubmission.created_at)).limit(5))).scalars().all()
-    text = "📜 **Последние действия:**\n"
+    text = "📜 **Последние выполненные задания:**\n"
     for s in subs:
         text += f"• Задание #{s.task_id}: {s.status.value} (+{s.reward_gmp_snapshot} GMP)\n"
     await msg.answer(text, parse_mode="Markdown")
 
-# =====================================================================
-# 👑 8. РАСШИРЕННАЯ АДМИН-ПАНЕЛЬ
-# =====================================================================
+# --- АДМИН-ПАНЕЛЬ ---
 @dp.message(Command("admin"))
 async def cmd_admin(msg: Message, is_admin: bool):
     if is_admin:
@@ -479,9 +481,10 @@ async def adm_stats(call: CallbackQuery, repo: Repository, is_admin: bool):
     stats = await repo.get_stats()
     text = (
         f"📊 **Статистика Бота:**\n\n"
-        f"👥 Всего пользователей: `{stats['total_users']}`\n"
-        f"📋 Активных заданий: `{stats['total_tasks']}`\n"
-        f"⏳ Заданий на проверке: `{stats['pending_subs']}`\n"
+        f"🔗 GitHub: `{GITHUB_OWNER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n"
+        f"👥 Пользователей: `{stats['total_users']}`\n"
+        f"📋 Заданий: `{stats['total_tasks']}`\n"
+        f"⏳ На проверке: `{stats['pending_subs']}`\n"
         f"💸 Заявок на вывод: `{stats['pending_wths']}`"
     )
     await call.message.edit_text(text, reply_markup=admin_main_kb(), parse_mode="Markdown")
@@ -498,8 +501,8 @@ async def adm_settings_menu(call: CallbackQuery, repo: Repository, is_admin: boo
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
     ])
     await call.message.edit_text(
-        f"⚙️ **Текущие настройки:**\n\n"
-        f"📈 Курс: 1 GMP = {rate} валюты\n"
+        f"⚙️ **Настройки бота:**\n\n"
+        f"📈 Курс: 1 GMP = {rate}\n"
         f"🔻 Мин. вывод: {min_w} GMP",
         reply_markup=kb, parse_mode="Markdown"
     )
@@ -519,19 +522,19 @@ async def set_rate_start(call: CallbackQuery, state: FSMContext, is_admin: bool)
 async def set_rate_finish(msg: Message, state: FSMContext, repo: Repository):
     await repo.set_setting("gmp_rate", msg.text.strip().replace(',', '.'))
     await state.clear()
-    await msg.answer("✅ Курс успешно обновлен!")
+    await msg.answer("✅ Курс обновлен!")
 
 @dp.callback_query(F.data == "set_min_w")
 async def set_min_w_start(call: CallbackQuery, state: FSMContext, is_admin: bool):
     if not is_admin: return
     await state.set_state(AdminSettingsFSM.waiting_for_min_withdraw)
-    await call.message.answer("Введите минимальную сумму вывода в GMP:")
+    await call.message.answer("Введите мин. вывод в GMP:")
 
 @dp.message(AdminSettingsFSM.waiting_for_min_withdraw)
 async def set_min_w_finish(msg: Message, state: FSMContext, repo: Repository):
     await repo.set_setting("min_withdraw", msg.text.strip())
     await state.clear()
-    await msg.answer("✅ Минимальная сумма вывода обновлена!")
+    await msg.answer("✅ Мин. вывод обновлен!")
 
 @dp.callback_query(F.data == "admin_add_task")
 async def adm_add_task(call: CallbackQuery, state: FSMContext, is_admin: bool):
@@ -554,11 +557,11 @@ async def adm_t2(msg: Message, state: FSMContext):
 @dp.message(CreateTaskFSM.reward)
 async def adm_t3(msg: Message, state: FSMContext, repo: Repository):
     data = await state.get_data()
-    task = Task(title=data["title"], description=data["desc"], instructions="Инструкция", reward_gmp=int(msg.text))
+    task = Task(title=data["title"], description=data["desc"], reward_gmp=int(msg.text))
     repo.session.add(task)
     await repo.session.commit()
     await state.clear()
-    await msg.answer("✅ Задание создано!")
+    await msg.answer("✅ Задание добавлено!")
 
 @dp.callback_query(F.data == "admin_check_tasks")
 async def adm_check_t(call: CallbackQuery, repo: Repository, is_admin: bool):
@@ -604,19 +607,34 @@ async def adm_app_wth(call: CallbackQuery, repo: Repository, bot: Bot):
     ok, msg, wth = await repo.approve_withdrawal(int(call.data.split(":")[1]))
     if ok:
         user = await repo.session.get(User, wth.user_id)
-        await bot.send_message(user.telegram_id, f"✅ Вывод #{wth.id} на сумму {wth.amount_gmp} GMP успешно выполнен!")
+        await bot.send_message(user.telegram_id, f"✅ Вывод #{wth.id} на сумму {wth.amount_gmp} GMP выполнен!")
     await call.answer(msg)
 
 # =====================================================================
-# 🏁 9. ЗАПУСК
+# 🏁 8. ЗАПУСК WEB SERVICE ДЛЯ RENDER
 # =====================================================================
+async def health_check(request):
+    return web.Response(text="GMP Bot Web Service is Running!", status=200)
+
 async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
     dp.update.middleware(DbSessionMiddleware())
 
+    # Фоновые процессы
     asyncio.create_task(auto_ring_loop(bot))
     asyncio.create_task(periodic_cleanup_loop())
+
+    # Настройка HTTP-сервера для Render
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app_runner = web.AppRunner(app)
+    await app_runner.setup()
+    
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(app_runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 Веб-сервер запущен на порту {port}")
 
     await dp.start_polling(bot)
 
