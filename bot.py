@@ -101,7 +101,7 @@ class TaskSubmission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="submissions")
-    task: Mapped["Task"] = relationship(back_populates="task")
+    task: Mapped["Task"] = relationship(back_populates="submissions")  # Исправлено тут
 
 class Withdrawal(Base):
     __tablename__ = "withdrawals"
