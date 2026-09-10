@@ -1,6 +1,7 @@
 import asyncio
 import enum
 import logging
+import os
 from datetime import datetime
 from typing import Optional, Sequence, Tuple
 
@@ -20,16 +21,21 @@ from sqlalchemy import (
     ForeignKey, select, and_, desc
 )
 from sqlalchemy.ext.asyncio import (
-    create_async_engine, async_sessionmaker, AsyncSession, DeclarativeBase
+    create_async_engine, async_sessionmaker, AsyncSession
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+# ИСПРАВЛЕНО: DeclarativeBase импортируется из sqlalchemy.orm
+from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
 
 # =====================================================================
-# 🛠 1. КОНФИГУРАЦИЯ
+# 🛠 1. КОНФИГУРАЦИЯ (Считываем из Environment Variables)
 # =====================================================================
-BOT_TOKEN = "ТВОЙ_ТОКЕН_БОТА"
-ADMIN_IDS = [123456789]  # Укажи свой Telegram ID (целое число)
-DB_URL = "sqlite+aiosqlite:///./gmp_bot.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
+
+# Преобразуем строку с ID админов из переменных окружения в список чисел
+admin_id_raw = os.getenv("ADMIN_IDS", "123456789")
+ADMIN_IDS = [int(x.strip()) for x in admin_id_raw.split(",") if x.strip().isdigit()]
+
+DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./gmp_bot.db")
 
 # Настройка логирования
 logging.basicConfig(
@@ -305,16 +311,10 @@ class Repository:
             return True, "Вывод одобрен.", wth
 
 # =====================================================================
-# 🔄 4. ФОНОВЫЙ АВТО-РИНГ (КАЖДЫЕ 5 МИНУТ, БЕСКОНЕЧНЫЕ ПОПЫТКИ)
+# 🔄 4. ФОНОВЫЙ АВТО-РИНГ (КАЖДЫЕ 5 МИНУТ)
 # =====================================================================
 async def auto_ring_loop(bot: Bot):
-    """
-    Каждые 5 минут делает запрос на сайт/сервер.
-    Если сайт не отвечает или ошибка — повторяет попытку бесконечно на следующем цикле.
-    """
     logging.info("🚀 Фоновый авто-ринг запущен (интервал: 5 минут).")
-    
-    # Сда вставьте URL вашего целевого сайта или API
     TARGET_URL = "https://httpbin.org/get"
 
     while True:
@@ -322,16 +322,12 @@ async def auto_ring_loop(bot: Bot):
             async with aiohttp.ClientSession() as session:
                 async with session.get(TARGET_URL, timeout=15) as response:
                     if response.status == 200:
-                        logging.info(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Авто-ринг успешен! Сайт доступен.")
-                        # Здесь вы можете добавить свою логику при успешном заходе на сайт
+                        logging.info(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Авто-ринг успешен!")
                     else:
-                        logging.warning(f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] Сайт вернул код {response.status}. Повтор через 5 минут...")
-
+                        logging.warning(f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] Код {response.status}. Повтор через 5 минут...")
         except Exception as e:
-            # При ошибках сети, таймаутах или падении сайта бот НЕ падает
-            logging.error(f"❌ [{datetime.now().strftime('%H:%M:%S')}] Ошибка соединения с сайтом: {e}. Следующая попытка через 5 минут...")
+            logging.error(f"❌ [{datetime.now().strftime('%H:%M:%S')}] Ошибка связи: {e}. Следующая попытка через 5 минут...")
 
-        # Задержка 5 минут (300 секунд) перед следующей попыткой
         await asyncio.sleep(300)
 
 # =====================================================================
@@ -582,7 +578,7 @@ async def main():
     # Запуск авто-ринга в фоновом режиме
     asyncio.create_task(auto_ring_loop(bot))
 
-    # Запуск приема команд бота
+    # Запуск поллинга
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
