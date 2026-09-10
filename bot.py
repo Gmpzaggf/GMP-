@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
 
 # Настройки GitHub API
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP-")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
@@ -101,7 +101,7 @@ class TaskSubmission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="submissions")
-    task: Mapped["Task"] = relationship(back_populates="submissions")
+    task: Mapped["Task"] = relationship(back_populates="task")
 
 class Withdrawal(Base):
     __tablename__ = "withdrawals"
@@ -135,7 +135,7 @@ async def init_db():
     async with AsyncSessionLocal() as session:
         async with session.begin():
             if not await session.get(Setting, "gmp_rate"):
-                session.add(Setting(key="gmp_rate", value="0.10"))
+                session.add(Setting(key="gmp_rate", value="1.00"))
             if not await session.get(Setting, "min_withdraw"):
                 session.add(Setting(key="min_withdraw", value="500"))
 
@@ -218,7 +218,7 @@ class Repository:
         async with self.session.begin():
             user = await self.session.get(User, user_id, with_for_update=True)
             min_w = int(await self.get_setting("min_withdraw", "500"))
-            rate = float(await self.get_setting("gmp_rate", "0.10"))
+            rate = float(await self.get_setting("gmp_rate", "1.00"))
 
             if amount_gmp < min_w or user.balance_active < amount_gmp:
                 return False, "Недостаточно средств или меньше минимума.", None
@@ -362,11 +362,10 @@ async def cmd_help(msg: Message):
 @dp.message(F.text == "💰 Баланс")
 async def cmd_balance(msg: Message, repo: Repository):
     user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    rate = float(await repo.get_setting("gmp_rate", "0.10"))
     await msg.answer(
         f"💰 **Ваш баланс:**\n\n"
-        f"💳 Доступно: {user.balance_active} GMP (≈ {round(user.balance_active * rate, 2)} грн)\n"
-        f"🔒 На выводе: {user.balance_locked} GMP",
+        f"💳 Доступно: `{user.balance_active}` GMP\n"
+        f"🔒 На выводе: `{user.balance_locked}` GMP",
         parse_mode="Markdown"
     )
 
@@ -381,7 +380,7 @@ async def cmd_profile(msg: Message, repo: Repository, is_admin: bool):
         f"ID: `{user.telegram_id}`\n"
         f"Логин: @{user.username}\n"
         f"Репозиторий: `{GITHUB_OWNER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n"
-        f"Баланс: {user.balance_active} GMP"
+        f"Баланс: `{user.balance_active}` GMP"
     )
     if is_admin:
         text += "\n\n💡 _Панель администратора доступна по /admin_"
@@ -492,17 +491,17 @@ async def adm_stats(call: CallbackQuery, repo: Repository, is_admin: bool):
 @dp.callback_query(F.data == "admin_settings")
 async def adm_settings_menu(call: CallbackQuery, repo: Repository, is_admin: bool):
     if not is_admin: return
-    rate = await repo.get_setting("gmp_rate", "0.10")
+    rate = await repo.get_setting("gmp_rate", "1.00")
     min_w = await repo.get_setting("min_withdraw", "500")
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить курс GMP", callback_data="set_rate")],
+        [InlineKeyboardButton(text="✏️ Изменить множитель GMP", callback_data="set_rate")],
         [InlineKeyboardButton(text="✏️ Изменить мин. вывод", callback_data="set_min_w")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
     ])
     await call.message.edit_text(
         f"⚙️ **Настройки бота:**\n\n"
-        f"📈 Курс: 1 GMP = {rate}\n"
+        f"📈 Коэффициент: {rate}\n"
         f"🔻 Мин. вывод: {min_w} GMP",
         reply_markup=kb, parse_mode="Markdown"
     )
@@ -516,13 +515,13 @@ async def adm_back(call: CallbackQuery, is_admin: bool):
 async def set_rate_start(call: CallbackQuery, state: FSMContext, is_admin: bool):
     if not is_admin: return
     await state.set_state(AdminSettingsFSM.waiting_for_rate)
-    await call.message.answer("Введите новый курс (например, `0.15`):")
+    await call.message.answer("Введите новый коэффициент:")
 
 @dp.message(AdminSettingsFSM.waiting_for_rate)
 async def set_rate_finish(msg: Message, state: FSMContext, repo: Repository):
     await repo.set_setting("gmp_rate", msg.text.strip().replace(',', '.'))
     await state.clear()
-    await msg.answer("✅ Курс обновлен!")
+    await msg.answer("✅ Значение обновлено!")
 
 @dp.callback_query(F.data == "set_min_w")
 async def set_min_w_start(call: CallbackQuery, state: FSMContext, is_admin: bool):
@@ -596,7 +595,7 @@ async def adm_wth_menu(call: CallbackQuery, repo: Repository, is_admin: bool):
     if not wth:
         await call.message.edit_text("🎉 Все заявки на вывод обработаны!")
         return
-    text = f"💸 **Вывод #{wth.id}**\nСумма: {wth.amount_gmp} GMP ({wth.amount_money})\nРеквизиты: `{wth.requisites}`"
+    text = f"💸 **Вывод #{wth.id}**\nСумма: {wth.amount_gmp} GMP\nРеквизиты: `{wth.requisites}`"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить выплату", callback_data=f"app_w:{wth.id}")
     ]])
