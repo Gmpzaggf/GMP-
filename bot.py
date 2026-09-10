@@ -29,18 +29,23 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
 # =====================================================================
 # 🛠 1. КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Настройки GitHub API
+# Настройки GitHub API (параметры берутся из Environment variables)
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP-")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-admin_id_raw = os.getenv("ADMIN_IDS", "123456789")
+admin_id_raw = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in admin_id_raw.split(",") if x.strip().isdigit()]
 
+# Поддержка базы данных (если передана строка PostgreSQL или SQLite)
 DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./gmp_bot.db")
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DB_URL.startswith("postgresql://"):
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,7 +106,7 @@ class TaskSubmission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="submissions")
-    task: Mapped["Task"] = relationship(back_populates="submissions")  # Исправлено тут
+    task: Mapped["Task"] = relationship(back_populates="submissions")
 
 class Withdrawal(Base):
     __tablename__ = "withdrawals"
@@ -257,23 +262,7 @@ class Repository:
 # =====================================================================
 # 🔄 4. ФОНОВЫЕ ЗАДАЧИ И GITHUB HELPER
 # =====================================================================
-async def fetch_github_file_info(file_path: str):
-    """ Вспомогательная функция для взаимодействия с GitHub API """
-    if not GITHUB_TOKEN:
-        return None
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
-
 async def auto_ring_loop(bot: Bot):
-    """ Self-Ping для предотвращения засыпания Render Web Service """
     target_url = os.getenv("RENDER_EXTERNAL_URL", "https://httpbin.org/get")
     while True:
         try:
@@ -286,7 +275,6 @@ async def auto_ring_loop(bot: Bot):
         await asyncio.sleep(600)
 
 async def periodic_cleanup_loop():
-    """ Авто-очистка устаревших данных раз в 24 часа """
     while True:
         try:
             async with AsyncSessionLocal() as session:
