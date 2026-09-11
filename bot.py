@@ -2,6 +2,9 @@ import asyncio
 import enum
 import logging
 import os
+import base64
+import json
+from urllib.parse import quote
 from contextlib import suppress
 from datetime import datetime
 from typing import Optional, Sequence, Tuple
@@ -59,6 +62,8 @@ ADMIN_IDS = [
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP-")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_DATA_PATH = os.getenv("GITHUB_DATA_PATH", "data/gmp_data.json").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -234,12 +239,300 @@ SessionLocal = async_sessionmaker(
 )
 
 
+class GitHubPersistence:
+    """
+    GitHub JSON backup/restore.
+
+    The token stays in Render Environment Variables. The JSON file is stored
+    in the repository and is updated after every successful DB commit.
+    This is a backup layer; Render PostgreSQL is still the recommended
+    primary database for production.
+    """
+
+    def __init__(self) -> None:
+        self.owner = GITHUB_OWNER
+        self.repo = GITHUB_REPO
+        self.branch = GITHUB_BRANCH
+        self.token = GITHUB_TOKEN
+        self.path = GITHUB_DATA_PATH
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.owner and self.repo and self.path)
+
+    @property
+    def url(self) -> str:
+        return (
+            f"https://api.github.com/repos/{quote(self.owner)}/"
+            f"{quote(self.repo)}/contents/{quote(self.path, safe='/')}"
+        )
+
+    def _headers(self) -> dict:
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "GMP-Telegram-Bot",
+            "Content-Type": "application/json",
+        }
+
+    async def _get_file(self, http: "aiohttp.ClientSession"):
+        async with http.get(
+            self.url,
+            headers=self._headers(),
+            params={"ref": self.branch},
+        ) as response:
+            if response.status == 404:
+                return None, None
+            if response.status != 200:
+                body = await response.text()
+                raise RuntimeError(
+                    f"GitHub GET failed: HTTP {response.status}: {body[:300]}"
+                )
+            payload = await response.json()
+            content = base64.b64decode(payload["content"].replace("\n", "")).decode(
+                "utf-8"
+            )
+            return json.loads(content), payload.get("sha")
+
+    async def load_snapshot(self) -> Optional[dict]:
+        if not self.enabled:
+            logger.warning("GitHub persistence disabled: GITHUB_TOKEN is missing.")
+            return None
+
+        import aiohttp
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                data, _ = await self._get_file(http)
+                return data
+        except Exception as exc:
+            logger.exception("Could not load data from GitHub: %s", exc)
+            return None
+
+    async def save_snapshot(self, session: AsyncSession) -> bool:
+        if not self.enabled:
+            logger.warning("GitHub persistence disabled: GITHUB_TOKEN is missing.")
+            return False
+
+        import aiohttp
+
+        async with self._lock:
+            # Read all data from the committed database state.
+            users = (await session.execute(select(User))).scalars().all()
+            tasks = (await session.execute(select(Task))).scalars().all()
+            submissions = (
+                await session.execute(select(TaskSubmission))
+            ).scalars().all()
+            withdrawals = (
+                await session.execute(select(Withdrawal))
+            ).scalars().all()
+            settings = (await session.execute(select(Setting))).scalars().all()
+
+            snapshot = {
+                "version": 2,
+                "saved_at": datetime.utcnow().isoformat(),
+                "users": [
+                    {
+                        "id": u.id,
+                        "telegram_id": u.telegram_id,
+                        "username": u.username,
+                        "balance_active": u.balance_active,
+                        "balance_locked": u.balance_locked,
+                        "created_at": u.created_at.isoformat(),
+                    }
+                    for u in users
+                ],
+                "tasks": [
+                    {
+                        "id": t.id,
+                        "title": t.title,
+                        "description": t.description,
+                        "reward_gmp": t.reward_gmp,
+                        "is_active": t.is_active,
+                        "created_at": t.created_at.isoformat(),
+                    }
+                    for t in tasks
+                ],
+                "submissions": [
+                    {
+                        "id": x.id,
+                        "user_id": x.user_id,
+                        "task_id": x.task_id,
+                        "reward_gmp_snapshot": x.reward_gmp_snapshot,
+                        "status": x.status.value,
+                        "proof_type": x.proof_type,
+                        "proof_data": x.proof_data,
+                        "created_at": x.created_at.isoformat(),
+                    }
+                    for x in submissions
+                ],
+                "withdrawals": [
+                    {
+                        "id": w.id,
+                        "user_id": w.user_id,
+                        "amount_gmp": w.amount_gmp,
+                        "amount_money": w.amount_money,
+                        "requisites": w.requisites,
+                        "status": w.status.value,
+                        "created_at": w.created_at.isoformat(),
+                    }
+                    for w in withdrawals
+                ],
+                "settings": [
+                    {"key": x.key, "value": x.value}
+                    for x in settings
+                ],
+            }
+
+            raw = json.dumps(
+                snapshot, ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8")
+            encoded = base64.b64encode(raw).decode("ascii")
+
+            timeout = aiohttp.ClientTimeout(total=60)
+            last_error = None
+
+            for attempt in range(1, 4):
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as http:
+                        # Always fetch the latest SHA immediately before PUT.
+                        _, sha = await self._get_file(http)
+
+                        body = {
+                            "message": "chore: save GMP bot data",
+                            "content": encoded,
+                            "branch": self.branch,
+                        }
+                        if sha:
+                            body["sha"] = sha
+
+                        async with http.put(
+                            self.url,
+                            headers=self._headers(),
+                            json=body,
+                        ) as response:
+                            if response.status in (200, 201):
+                                logger.info(
+                                    "GitHub data saved: %s users, %s tasks, %s submissions, %s withdrawals",
+                                    len(users),
+                                    len(tasks),
+                                    len(submissions),
+                                    len(withdrawals),
+                                )
+                                return True
+
+                            response_body = await response.text()
+                            last_error = RuntimeError(
+                                f"GitHub PUT failed: HTTP {response.status}: {response_body[:300]}"
+                            )
+                except Exception as exc:
+                    last_error = exc
+
+                await asyncio.sleep(attempt)
+
+            logger.error("GitHub save failed after 3 attempts: %s", last_error)
+            return False
+
+
+github_persistence = GitHubPersistence()
+
+
+async def restore_from_github(session: AsyncSession) -> bool:
+    """Restore the GitHub snapshot only when the local DB has no application data."""
+    counts = {
+        "users": (await session.execute(select(func.count(User.id)))).scalar_one(),
+        "tasks": (await session.execute(select(func.count(Task.id)))).scalar_one(),
+        "submissions": (
+            await session.execute(select(func.count(TaskSubmission.id)))
+        ).scalar_one(),
+        "withdrawals": (
+            await session.execute(select(func.count(Withdrawal.id)))
+        ).scalar_one(),
+    }
+
+    if any(counts.values()):
+        return False
+
+    snapshot = await github_persistence.load_snapshot()
+    if not snapshot:
+        return False
+
+    try:
+        # Insert in dependency order.
+        for item in snapshot.get("users", []):
+            session.add(
+                User(
+                    id=int(item["id"]),
+                    telegram_id=int(item["telegram_id"]),
+                    username=item.get("username"),
+                    balance_active=int(item.get("balance_active", 0)),
+                    balance_locked=int(item.get("balance_locked", 0)),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                )
+            )
+
+        for item in snapshot.get("tasks", []):
+            session.add(
+                Task(
+                    id=int(item["id"]),
+                    title=item["title"],
+                    description=item["description"],
+                    reward_gmp=int(item["reward_gmp"]),
+                    is_active=bool(item.get("is_active", True)),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                )
+            )
+
+        for item in snapshot.get("submissions", []):
+            session.add(
+                TaskSubmission(
+                    id=int(item["id"]),
+                    user_id=int(item["user_id"]),
+                    task_id=int(item["task_id"]),
+                    reward_gmp_snapshot=int(item["reward_gmp_snapshot"]),
+                    status=SubmissionStatus(item["status"]),
+                    proof_type=item["proof_type"],
+                    proof_data=item["proof_data"],
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                )
+            )
+
+        for item in snapshot.get("withdrawals", []):
+            session.add(
+                Withdrawal(
+                    id=int(item["id"]),
+                    user_id=int(item["user_id"]),
+                    amount_gmp=int(item["amount_gmp"]),
+                    amount_money=float(item["amount_money"]),
+                    requisites=item["requisites"],
+                    status=WithdrawalStatus(item["status"]),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                )
+            )
+
+        for item in snapshot.get("settings", []):
+            session.add(Setting(key=item["key"], value=item["value"]))
+
+        await session.commit()
+        logger.info("Database restored from GitHub snapshot.")
+        return True
+    except Exception:
+        await session.rollback()
+        logger.exception("GitHub restore failed; database was rolled back.")
+        return False
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     async with SessionLocal() as session:
         try:
+            restored = await restore_from_github(session)
+
             if await session.get(Setting, "gmp_rate") is None:
                 session.add(Setting(key="gmp_rate", value="1.00"))
 
@@ -247,11 +540,19 @@ async def init_db() -> None:
                 session.add(Setting(key="min_withdraw", value="500"))
 
             await session.commit()
+
+            # If GitHub had no snapshot, create the first one now.
+            if not restored:
+                await github_persistence.save_snapshot(session)
         except Exception:
             await session.rollback()
             raise
 
-    logger.info("Database initialized: %s", DATABASE_URL.split("@")[-1])
+    logger.info(
+        "Database initialized: %s | GitHub persistence: %s",
+        DATABASE_URL.split("@")[-1],
+        "ON" if github_persistence.enabled else "OFF",
+    )
 
 
 # ============================================================
@@ -261,6 +562,11 @@ async def init_db() -> None:
 class Repository:
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def commit(self) -> None:
+        """Commit DB changes and immediately mirror the new state to GitHub."""
+        await self.session.commit()
+        await github_persistence.save_snapshot(self.session)
 
     async def get_or_create_user(
         self, telegram_id: int, username: Optional[str]
@@ -279,7 +585,7 @@ class Repository:
             )
             self.session.add(user)
             try:
-                await self.session.commit()
+                await self.commit()
                 await self.session.refresh(user)
             except IntegrityError:
                 await self.session.rollback()
@@ -289,7 +595,7 @@ class Repository:
                 user = result.scalar_one()
         elif user.username != username:
             user.username = username
-            await self.session.commit()
+            await self.commit()
 
         return user
 
@@ -307,7 +613,7 @@ class Repository:
                 self.session.add(Setting(key=key, value=value))
             else:
                 setting.value = value
-            await self.session.commit()
+            await self.commit()
         except Exception:
             await self.session.rollback()
             raise
@@ -418,7 +724,7 @@ class Repository:
             )
 
             self.session.add(submission)
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(submission)
             return submission
 
@@ -462,7 +768,7 @@ class Repository:
             user.balance_active += submission.reward_gmp_snapshot
             submission.status = SubmissionStatus.APPROVED
 
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(submission)
 
             return True, "Одобрено.", submission
@@ -490,7 +796,7 @@ class Repository:
                 return False, "Заявка не найдена или уже обработана.", None
 
             submission.status = SubmissionStatus.REJECTED
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(submission)
 
             return True, "Отклонено.", submission
@@ -556,7 +862,7 @@ class Repository:
             )
 
             self.session.add(withdrawal)
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(withdrawal)
 
             return True, "Заявка создана.", withdrawal
@@ -595,7 +901,7 @@ class Repository:
             )
             withdrawal.status = WithdrawalStatus.APPROVED
 
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(withdrawal)
 
             return True, "Вывод одобрен.", withdrawal
@@ -636,7 +942,7 @@ class Repository:
             user.balance_active += withdrawal.amount_gmp
             withdrawal.status = WithdrawalStatus.REJECTED
 
-            await self.session.commit()
+            await self.commit()
             await self.session.refresh(withdrawal)
 
             return True, "Вывод отклонён, GMP возвращены.", withdrawal
@@ -1509,7 +1815,7 @@ async def adm_t3(
 
     try:
         repo.session.add(task)
-        await repo.session.commit()
+        await repo.commit()
         await repo.session.refresh(task)
     except Exception:
         await repo.session.rollback()
