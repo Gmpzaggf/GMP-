@@ -1,5 +1,5 @@
 {
-  "saved_at": "2026-09-11T17:55:01.845716",
+  "saved_at": "2026-09-11T17:55:27.685649",
   "settings": [
     {
       "key": "gmp_rate",
@@ -11,7 +11,16 @@
     }
   ],
   "submissions": [],
-  "tasks": [],
+  "tasks": [
+    {
+      "created_at": "2026-09-11T17:55:27.673415",
+      "description": "8",
+      "id": 1,
+      "is_active": true,
+      "reward_gmp": 2,
+      "title": "6"
+    }
+  ],
   "users": [
     {
       "balance_active": 0,
