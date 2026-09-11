@@ -2,84 +2,134 @@ import asyncio
 import enum
 import logging
 import os
-from datetime import datetime, timedelta
+from contextlib import suppress
+from datetime import datetime
 from typing import Optional, Sequence, Tuple
 
-import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.filters import CommandStart, Command
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, TelegramObject,
-    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
 )
-
 from sqlalchemy import (
-    BigInteger, String, Text, Integer, Float, Boolean, DateTime, Enum as SQLEnum,
-    ForeignKey, select, and_, desc, func, delete
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum as SQLEnum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    and_,
+    desc,
+    func,
+    select,
 )
-from sqlalchemy.ext.asyncio import (
-    create_async_engine, async_sessionmaker, AsyncSession
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-# =====================================================================
-# 🛠 1. КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Настройки GitHub API (параметры берутся из Environment variables)
+# ============================================================
+# 1. CONFIG
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+ADMIN_IDS = [
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+]
+
+# GitHub variables are kept for information/diagnostics.
+# IMPORTANT: GitHub is NOT used as the database.
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP-")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-admin_id_raw = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in admin_id_raw.split(",") if x.strip().isdigit()]
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Поддержка базы данных (если передана строка PostgreSQL или SQLite)
-DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./gmp_bot.db")
-if DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DB_URL.startswith("postgresql://"):
-    DB_URL = DB_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# SQLite is useful locally, but Render's filesystem is ephemeral.
+# Therefore production MUST use Render PostgreSQL.
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite+aiosqlite:///./gmp_bot.db"
+    logging.warning(
+        "DATABASE_URL is not set. SQLite is being used. "
+        "On Render this database will NOT survive a redeploy/restart."
+    )
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in Environment Variables.")
+
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS is not set or contains no valid Telegram IDs.")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logger = logging.getLogger("gmp_bot")
 
-# =====================================================================
-# 📦 2. МОДЕЛИ БАЗЫ ДАННЫХ
-# =====================================================================
+
+# ============================================================
+# 2. DATABASE MODELS
+# ============================================================
+
 class Base(DeclarativeBase):
     pass
+
 
 class SubmissionStatus(str, enum.Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
 
+
 class WithdrawalStatus(str, enum.Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
 
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
-    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, index=True, nullable=False
+    )
+    username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     balance_active: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     balance_locked: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
-    submissions: Mapped[list["TaskSubmission"]] = relationship(back_populates="user")
-    withdrawals: Mapped[list["Withdrawal"]] = relationship(back_populates="user")
+    submissions: Mapped[list["TaskSubmission"]] = relationship(
+        back_populates="user", lazy="select"
+    )
+    withdrawals: Mapped[list["Withdrawal"]] = relationship(
+        back_populates="user", lazy="select"
+    )
+
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -89,37 +139,64 @@ class Task(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     reward_gmp: Mapped[int] = mapped_column(Integer, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
-    submissions: Mapped[list["TaskSubmission"]] = relationship(back_populates="task")
+    submissions: Mapped[list["TaskSubmission"]] = relationship(
+        back_populates="task", lazy="select"
+    )
+
 
 class TaskSubmission(Base):
     __tablename__ = "task_submissions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id"), nullable=False, index=True
+    )
     reward_gmp_snapshot: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[SubmissionStatus] = mapped_column(SQLEnum(SubmissionStatus), default=SubmissionStatus.PENDING, nullable=False, index=True)
+    status: Mapped[SubmissionStatus] = mapped_column(
+        SQLEnum(SubmissionStatus),
+        default=SubmissionStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
     proof_type: Mapped[str] = mapped_column(String(32), nullable=False)
     proof_data: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
     user: Mapped["User"] = relationship(back_populates="submissions")
     task: Mapped["Task"] = relationship(back_populates="submissions")
+
 
 class Withdrawal(Base):
     __tablename__ = "withdrawals"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
     amount_gmp: Mapped[int] = mapped_column(Integer, nullable=False)
     amount_money: Mapped[float] = mapped_column(Float, nullable=False)
     requisites: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[WithdrawalStatus] = mapped_column(SQLEnum(WithdrawalStatus), default=WithdrawalStatus.PENDING, nullable=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    status: Mapped[WithdrawalStatus] = mapped_column(
+        SQLEnum(WithdrawalStatus),
+        default=WithdrawalStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
     user: Mapped["User"] = relationship(back_populates="withdrawals")
+
 
 class Setting(Base):
     __tablename__ = "settings"
@@ -127,503 +204,1711 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
-# =====================================================================
-# ⚙️ 3. ИНИЦИАЛИЗАЦИЯ И РЕПОЗИТОРИЙ БД
-# =====================================================================
-engine = create_async_engine(DB_URL, echo=False)
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-async def init_db():
+# ============================================================
+# 3. DATABASE ENGINE
+# ============================================================
+
+engine_kwargs = {
+    "echo": False,
+    "pool_pre_ping": True,
+}
+
+# PostgreSQL connection pool. SQLite does not support these pool args.
+if DATABASE_URL.startswith("postgresql+asyncpg://"):
+    engine_kwargs.update(
+        {
+            "pool_size": 5,
+            "max_overflow": 10,
+            "pool_recycle": 1800,
+        }
+    )
+
+engine = create_async_engine(DATABASE_URL, **engine_kwargs)
+
+SessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+)
+
+
+async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            if not await session.get(Setting, "gmp_rate"):
+
+    async with SessionLocal() as session:
+        try:
+            if await session.get(Setting, "gmp_rate") is None:
                 session.add(Setting(key="gmp_rate", value="1.00"))
-            if not await session.get(Setting, "min_withdraw"):
+
+            if await session.get(Setting, "min_withdraw") is None:
                 session.add(Setting(key="min_withdraw", value="500"))
+
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+    logger.info("Database initialized: %s", DATABASE_URL.split("@")[-1])
+
+
+# ============================================================
+# 4. REPOSITORY
+# ============================================================
 
 class Repository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get_or_create_user(self, telegram_id: int, username: Optional[str]) -> User:
-        stmt = select(User).where(User.telegram_id == telegram_id)
-        res = await self.session.execute(stmt)
-        user = res.scalar_one_or_none()
-        if not user:
-            user = User(telegram_id=telegram_id, username=username)
+    async def get_or_create_user(
+        self, telegram_id: int, username: Optional[str]
+    ) -> User:
+        result = await self.session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            user = User(
+                telegram_id=telegram_id,
+                username=username,
+                balance_active=0,
+                balance_locked=0,
+            )
             self.session.add(user)
-            await self.session.commit()
-            await self.session.refresh(user)
+            try:
+                await self.session.commit()
+                await self.session.refresh(user)
+            except IntegrityError:
+                await self.session.rollback()
+                result = await self.session.execute(
+                    select(User).where(User.telegram_id == telegram_id)
+                )
+                user = result.scalar_one()
         elif user.username != username:
             user.username = username
             await self.session.commit()
+
         return user
 
     async def get_setting(self, key: str, default: str) -> str:
-        res = await self.session.execute(select(Setting.value).where(Setting.key == key))
-        val = res.scalar_one_or_none()
-        return val if val is not None else default
+        result = await self.session.execute(
+            select(Setting.value).where(Setting.key == key)
+        )
+        value = result.scalar_one_or_none()
+        return value if value is not None else default
 
-    async def set_setting(self, key: str, value: str):
-        async with self.session.begin():
+    async def set_setting(self, key: str, value: str) -> None:
+        try:
             setting = await self.session.get(Setting, key)
-            if setting:
-                setting.value = value
-            else:
+            if setting is None:
                 self.session.add(Setting(key=key, value=value))
+            else:
+                setting.value = value
+            await self.session.commit()
+        except Exception:
+            await self.session.rollback()
+            raise
 
     async def get_stats(self) -> dict:
-        total_users = (await self.session.execute(select(func.count(User.id)))).scalar_one()
-        total_tasks = (await self.session.execute(select(func.count(Task.id)))).scalar_one()
-        pending_subs = (await self.session.execute(select(func.count(TaskSubmission.id)).where(TaskSubmission.status == SubmissionStatus.PENDING))).scalar_one()
-        pending_wths = (await self.session.execute(select(func.count(Withdrawal.id)).where(Withdrawal.status == WithdrawalStatus.PENDING))).scalar_one()
+        total_users = (
+            await self.session.execute(select(func.count(User.id)))
+        ).scalar_one()
+
+        total_tasks = (
+            await self.session.execute(select(func.count(Task.id)))
+        ).scalar_one()
+
+        pending_subs = (
+            await self.session.execute(
+                select(func.count(TaskSubmission.id)).where(
+                    TaskSubmission.status == SubmissionStatus.PENDING
+                )
+            )
+        ).scalar_one()
+
+        pending_wths = (
+            await self.session.execute(
+                select(func.count(Withdrawal.id)).where(
+                    Withdrawal.status == WithdrawalStatus.PENDING
+                )
+            )
+        ).scalar_one()
+
+        total_gmp = (
+            await self.session.execute(
+                select(func.coalesce(func.sum(User.balance_active), 0))
+            )
+        ).scalar_one()
+
         return {
             "total_users": total_users,
             "total_tasks": total_tasks,
             "pending_subs": pending_subs,
-            "pending_wths": pending_wths
+            "pending_wths": pending_wths,
+            "total_gmp": total_gmp,
         }
 
-    async def get_available_tasks_for_user(self, user_id: int) -> Sequence[Task]:
+    async def get_available_tasks_for_user(
+        self, user_id: int
+    ) -> Sequence[Task]:
         sub_query = select(TaskSubmission.task_id).where(
             and_(
                 TaskSubmission.user_id == user_id,
-                TaskSubmission.status.in_([SubmissionStatus.PENDING, SubmissionStatus.APPROVED])
+                TaskSubmission.status.in_(
+                    [SubmissionStatus.PENDING, SubmissionStatus.APPROVED]
+                ),
             )
         )
-        stmt = select(Task).where(and_(Task.is_active == True, Task.id.not_in(sub_query)))
-        return (await self.session.execute(stmt)).scalars().all()
 
-    async def create_submission(self, user_id: int, task_id: int, proof_type: str, proof_data: str) -> Optional[TaskSubmission]:
-        async with self.session.begin():
-            task = await self.session.get(Task, task_id)
-            if not task or not task.is_active: return None
-            sub = TaskSubmission(
-                user_id=user_id, task_id=task_id, reward_gmp_snapshot=task.reward_gmp,
-                status=SubmissionStatus.PENDING, proof_type=proof_type, proof_data=proof_data
+        result = await self.session.execute(
+            select(Task)
+            .where(
+                and_(
+                    Task.is_active.is_(True),
+                    Task.id.not_in(sub_query),
+                )
             )
-            self.session.add(sub)
-            return sub
+            .order_by(Task.id.desc())
+        )
+        return result.scalars().all()
 
-    async def approve_submission(self, submission_id: int) -> Tuple[bool, str, Optional[TaskSubmission]]:
-        async with self.session.begin():
-            sub = (await self.session.execute(select(TaskSubmission).where(TaskSubmission.id == submission_id).with_for_update())).scalar_one_or_none()
-            if not sub or sub.status != SubmissionStatus.PENDING:
+    async def get_task(self, task_id: int) -> Optional[Task]:
+        return await self.session.get(Task, task_id)
+
+    async def create_submission(
+        self,
+        user_id: int,
+        task_id: int,
+        proof_type: str,
+        proof_data: str,
+    ) -> Optional[TaskSubmission]:
+        try:
+            task = await self.session.get(Task, task_id)
+
+            if task is None or not task.is_active:
+                await self.session.rollback()
+                return None
+
+            # Prevent duplicate pending/approved submissions.
+            existing = await self.session.execute(
+                select(TaskSubmission.id).where(
+                    and_(
+                        TaskSubmission.user_id == user_id,
+                        TaskSubmission.task_id == task_id,
+                        TaskSubmission.status.in_(
+                            [SubmissionStatus.PENDING, SubmissionStatus.APPROVED]
+                        ),
+                    )
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                await self.session.rollback()
+                return None
+
+            submission = TaskSubmission(
+                user_id=user_id,
+                task_id=task_id,
+                reward_gmp_snapshot=task.reward_gmp,
+                status=SubmissionStatus.PENDING,
+                proof_type=proof_type,
+                proof_data=proof_data,
+            )
+
+            self.session.add(submission)
+            await self.session.commit()
+            await self.session.refresh(submission)
+            return submission
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def get_pending_submission(
+        self, submission_id: int
+    ) -> Optional[TaskSubmission]:
+        result = await self.session.execute(
+            select(TaskSubmission).where(TaskSubmission.id == submission_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def approve_submission(
+        self, submission_id: int
+    ) -> Tuple[bool, str, Optional[TaskSubmission]]:
+        try:
+            result = await self.session.execute(
+                select(TaskSubmission)
+                .where(TaskSubmission.id == submission_id)
+                .with_for_update()
+            )
+            submission = result.scalar_one_or_none()
+
+            if (
+                submission is None
+                or submission.status != SubmissionStatus.PENDING
+            ):
+                await self.session.rollback()
                 return False, "Заявка не найдена или уже обработана.", None
 
-            user = await self.session.get(User, sub.user_id, with_for_update=True)
-            user.balance_active += sub.reward_gmp_snapshot
-            sub.status = SubmissionStatus.APPROVED
-            return True, "Одобрено.", sub
+            user = await self.session.get(
+                User, submission.user_id, with_for_update=True
+            )
+            if user is None:
+                await self.session.rollback()
+                return False, "Пользователь не найден.", None
 
-    async def create_withdrawal(self, user_id: int, amount_gmp: int, requisites: str) -> Tuple[bool, str, Optional[Withdrawal]]:
-        async with self.session.begin():
-            user = await self.session.get(User, user_id, with_for_update=True)
-            min_w = int(await self.get_setting("min_withdraw", "500"))
-            rate = float(await self.get_setting("gmp_rate", "1.00"))
+            user.balance_active += submission.reward_gmp_snapshot
+            submission.status = SubmissionStatus.APPROVED
 
-            if amount_gmp < min_w or user.balance_active < amount_gmp:
-                return False, "Недостаточно средств или меньше минимума.", None
+            await self.session.commit()
+            await self.session.refresh(submission)
+
+            return True, "Одобрено.", submission
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def reject_submission(
+        self, submission_id: int
+    ) -> Tuple[bool, str, Optional[TaskSubmission]]:
+        try:
+            result = await self.session.execute(
+                select(TaskSubmission)
+                .where(TaskSubmission.id == submission_id)
+                .with_for_update()
+            )
+            submission = result.scalar_one_or_none()
+
+            if (
+                submission is None
+                or submission.status != SubmissionStatus.PENDING
+            ):
+                await self.session.rollback()
+                return False, "Заявка не найдена или уже обработана.", None
+
+            submission.status = SubmissionStatus.REJECTED
+            await self.session.commit()
+            await self.session.refresh(submission)
+
+            return True, "Отклонено.", submission
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def create_withdrawal(
+        self,
+        user_id: int,
+        amount_gmp: int,
+        requisites: str,
+    ) -> Tuple[bool, str, Optional[Withdrawal]]:
+        if amount_gmp <= 0:
+            return False, "Сумма должна быть больше нуля.", None
+
+        if not requisites.strip():
+            return False, "Реквизиты не могут быть пустыми.", None
+
+        try:
+            user = await self.session.get(
+                User, user_id, with_for_update=True
+            )
+            if user is None:
+                await self.session.rollback()
+                return False, "Пользователь не найден.", None
+
+            min_withdraw = int(
+                await self.get_setting("min_withdraw", "500")
+            )
+
+            try:
+                rate = float(await self.get_setting("gmp_rate", "1.00"))
+            except ValueError:
+                rate = 1.0
+
+            if amount_gmp < min_withdraw:
+                await self.session.rollback()
+                return (
+                    False,
+                    f"Минимальный вывод: {min_withdraw} GMP.",
+                    None,
+                )
+
+            if user.balance_active < amount_gmp:
+                await self.session.rollback()
+                return (
+                    False,
+                    f"Недостаточно GMP. Баланс: {user.balance_active}.",
+                    None,
+                )
 
             user.balance_active -= amount_gmp
             user.balance_locked += amount_gmp
 
-            wth = Withdrawal(
-                user_id=user.id, amount_gmp=amount_gmp, amount_money=round(amount_gmp * rate, 2),
-                requisites=requisites, status=WithdrawalStatus.PENDING
-            )
-            self.session.add(wth)
-            return True, "Заявка на вывод создана.", wth
-
-    async def approve_withdrawal(self, withdrawal_id: int) -> Tuple[bool, str, Optional[Withdrawal]]:
-        async with self.session.begin():
-            wth = (await self.session.execute(select(Withdrawal).where(Withdrawal.id == withdrawal_id).with_for_update())).scalar_one_or_none()
-            if not wth or wth.status != WithdrawalStatus.PENDING:
-                return False, "Заявка не найдена.", None
-
-            user = await self.session.get(User, wth.user_id, with_for_update=True)
-            user.balance_locked -= wth.amount_gmp
-            wth.status = WithdrawalStatus.APPROVED
-            return True, "Вывод одобрен.", wth
-
-    async def cleanup_old_data(self):
-        async with self.session.begin():
-            cutoff = datetime.utcnow() - timedelta(days=30)
-            await self.session.execute(
-                delete(TaskSubmission).where(and_(TaskSubmission.created_at < cutoff, TaskSubmission.status != SubmissionStatus.PENDING))
-            )
-            await self.session.execute(
-                delete(Withdrawal).where(and_(Withdrawal.created_at < cutoff, Withdrawal.status != WithdrawalStatus.PENDING))
+            withdrawal = Withdrawal(
+                user_id=user.id,
+                amount_gmp=amount_gmp,
+                amount_money=round(amount_gmp * rate, 2),
+                requisites=requisites.strip(),
+                status=WithdrawalStatus.PENDING,
             )
 
-# =====================================================================
-# 🔄 4. ФОНОВЫЕ ЗАДАЧИ И GITHUB HELPER
-# =====================================================================
-async def auto_ring_loop(bot: Bot):
-    target_url = os.getenv("RENDER_EXTERNAL_URL", "https://httpbin.org/get")
-    while True:
+            self.session.add(withdrawal)
+            await self.session.commit()
+            await self.session.refresh(withdrawal)
+
+            return True, "Заявка создана.", withdrawal
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def approve_withdrawal(
+        self, withdrawal_id: int
+    ) -> Tuple[bool, str, Optional[Withdrawal]]:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(target_url, timeout=15) as response:
-                    if response.status == 200:
-                        logging.info("✅ Self-Ping успешен!")
-        except Exception as e:
-            logging.error(f"❌ Ошибка Self-Ping: {e}")
-        await asyncio.sleep(600)
+            result = await self.session.execute(
+                select(Withdrawal)
+                .where(Withdrawal.id == withdrawal_id)
+                .with_for_update()
+            )
+            withdrawal = result.scalar_one_or_none()
 
-async def periodic_cleanup_loop():
-    while True:
+            if (
+                withdrawal is None
+                or withdrawal.status != WithdrawalStatus.PENDING
+            ):
+                await self.session.rollback()
+                return False, "Заявка не найдена или уже обработана.", None
+
+            user = await self.session.get(
+                User, withdrawal.user_id, with_for_update=True
+            )
+            if user is None:
+                await self.session.rollback()
+                return False, "Пользователь не найден.", None
+
+            user.balance_locked = max(
+                0, user.balance_locked - withdrawal.amount_gmp
+            )
+            withdrawal.status = WithdrawalStatus.APPROVED
+
+            await self.session.commit()
+            await self.session.refresh(withdrawal)
+
+            return True, "Вывод одобрен.", withdrawal
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def reject_withdrawal(
+        self, withdrawal_id: int
+    ) -> Tuple[bool, str, Optional[Withdrawal]]:
         try:
-            async with AsyncSessionLocal() as session:
-                repo = Repository(session)
-                await repo.cleanup_old_data()
-                logging.info("🧹 Авто-чистка БД завершена.")
-        except Exception as e:
-            logging.error(f"❌ Ошибка очистки БД: {e}")
-        await asyncio.sleep(86400)
+            result = await self.session.execute(
+                select(Withdrawal)
+                .where(Withdrawal.id == withdrawal_id)
+                .with_for_update()
+            )
+            withdrawal = result.scalar_one_or_none()
 
-# =====================================================================
-# 🔄 5. MIDDLEWARE И FSM
-# =====================================================================
+            if (
+                withdrawal is None
+                or withdrawal.status != WithdrawalStatus.PENDING
+            ):
+                await self.session.rollback()
+                return False, "Заявка не найдена или уже обработана.", None
+
+            user = await self.session.get(
+                User, withdrawal.user_id, with_for_update=True
+            )
+            if user is None:
+                await self.session.rollback()
+                return False, "Пользователь не найден.", None
+
+            # Return locked GMP to the active balance.
+            user.balance_locked = max(
+                0, user.balance_locked - withdrawal.amount_gmp
+            )
+            user.balance_active += withdrawal.amount_gmp
+            withdrawal.status = WithdrawalStatus.REJECTED
+
+            await self.session.commit()
+            await self.session.refresh(withdrawal)
+
+            return True, "Вывод отклонён, GMP возвращены.", withdrawal
+
+        except Exception:
+            await self.session.rollback()
+            raise
+
+    async def get_last_history(
+        self, user_id: int, limit: int = 10
+    ) -> tuple[list[TaskSubmission], list[Withdrawal]]:
+        submissions = (
+            await self.session.execute(
+                select(TaskSubmission)
+                .where(TaskSubmission.user_id == user_id)
+                .order_by(desc(TaskSubmission.created_at))
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        withdrawals = (
+            await self.session.execute(
+                select(Withdrawal)
+                .where(Withdrawal.user_id == user_id)
+                .order_by(desc(Withdrawal.created_at))
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        return list(submissions), list(withdrawals)
+
+
+# ============================================================
+# 5. MIDDLEWARE
+# ============================================================
+
 class DbSessionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
-        async with AsyncSessionLocal() as session:
+        async with SessionLocal() as session:
             data["repo"] = Repository(session)
-            data["is_admin"] = data.get("event_from_user").id in ADMIN_IDS if data.get("event_from_user") else False
-            return await handler(event, data)
+
+            event_user = data.get("event_from_user")
+            data["is_admin"] = bool(
+                event_user and event_user.id in ADMIN_IDS
+            )
+
+            try:
+                return await handler(event, data)
+            except Exception:
+                await session.rollback()
+                raise
+
+
+# ============================================================
+# 6. FSM
+# ============================================================
 
 class TaskSubmissionFSM(StatesGroup):
     waiting_for_proof = State()
 
+
 class WithdrawFSM(StatesGroup):
     waiting_for_amount = State()
     waiting_for_requisites = State()
+
 
 class CreateTaskFSM(StatesGroup):
     title = State()
     description = State()
     reward = State()
 
+
 class AdminSettingsFSM(StatesGroup):
     waiting_for_rate = State()
     waiting_for_min_withdraw = State()
 
-# =====================================================================
-# ⌨️ 6. КЛАВИАТУРЫ
-# =====================================================================
+
+# ============================================================
+# 7. KEYBOARDS
+# ============================================================
+
 def main_user_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📋 Задания"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📜 История")],
-            [KeyboardButton(text="💸 Вывод GMP"), KeyboardButton(text="ℹ️ Помощь")]
+            [
+                KeyboardButton(text="📋 Задания"),
+                KeyboardButton(text="👤 Профиль"),
+            ],
+            [
+                KeyboardButton(text="💰 Баланс"),
+                KeyboardButton(text="📜 История"),
+            ],
+            [
+                KeyboardButton(text="💸 Вывод GMP"),
+                KeyboardButton(text="ℹ️ Помощь"),
+            ],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
-def admin_main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="⚙️ Настройки курса", callback_data="admin_settings")],
-        [InlineKeyboardButton(text="➕ Создать задание", callback_data="admin_add_task")],
-        [InlineKeyboardButton(text="📝 Проверка заданий", callback_data="admin_check_tasks")],
-        [InlineKeyboardButton(text="💸 Заявки на вывод", callback_data="admin_withdraws_menu")]
-    ])
 
-# =====================================================================
-# 🚀 7. ХЭНДЛЕРЫ
-# =====================================================================
+def admin_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin_stats",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Настройки",
+                    callback_data="admin_settings",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать задание",
+                    callback_data="admin_add_task",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Проверка заданий",
+                    callback_data="admin_check_tasks",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💸 Заявки на вывод",
+                    callback_data="admin_withdraws_menu",
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# 8. BOT / DISPATCHER
+# ============================================================
+
 dp = Dispatcher(storage=MemoryStorage())
+
+
+def safe_username(message: Message) -> str:
+    username = message.from_user.username
+    return f"@{username}" if username else "не указан"
+
+
+# -------------------- START / HELP ---------------------------
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, repo: Repository):
-    await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    await msg.answer("👋 Добро пожаловать в GMP!", reply_markup=main_user_kb())
+    await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
 
+    await msg.answer(
+        "👋 <b>Добро пожаловать в GMP!</b>\n\n"
+        "Здесь можно выполнять задания, получать GMP и оформлять вывод.",
+        reply_markup=main_user_kb(),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("help"))
 @dp.message(F.text == "ℹ️ Помощь")
 async def cmd_help(msg: Message):
-    await msg.answer("ℹ️ Выполняйте задания, получайте GMP и выводите средства!")
+    await msg.answer(
+        "<b>ℹ️ Помощь</b>\n\n"
+        "📋 <b>Задания</b> — доступные задания.\n"
+        "💰 <b>Баланс</b> — доступные и заблокированные GMP.\n"
+        "📜 <b>История</b> — последние операции.\n"
+        "💸 <b>Вывод GMP</b> — создание заявки на вывод.\n"
+        "👤 <b>Профиль</b> — информация об аккаунте.\n\n"
+        "Если вы отправили отчёт, дождитесь проверки администратора.",
+        parse_mode="HTML",
+    )
 
+
+# -------------------- BALANCE / PROFILE ----------------------
+
+@dp.message(Command("balance"))
 @dp.message(F.text == "💰 Баланс")
 async def cmd_balance(msg: Message, repo: Repository):
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
+
     await msg.answer(
-        f"💰 **Ваш баланс:**\n\n"
-        f"💳 Доступно: `{user.balance_active}` GMP\n"
-        f"🔒 На выводе: `{user.balance_locked}` GMP",
-        parse_mode="Markdown"
+        f"💰 <b>Ваш баланс</b>\n\n"
+        f"💳 Доступно: <b>{user.balance_active}</b> GMP\n"
+        f"🔒 На выводе: <b>{user.balance_locked}</b> GMP",
+        parse_mode="HTML",
     )
 
+
+@dp.message(Command("profile"))
 @dp.message(F.text == "👤 Профиль")
-async def cmd_profile(msg: Message, repo: Repository, is_admin: bool):
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    role_str = "👑 Администратор" if is_admin else "👤 Пользователь"
-    
-    text = (
-        f"👤 **Ваш Профиль:**\n"
-        f"Статус: {role_str}\n"
-        f"ID: `{user.telegram_id}`\n"
-        f"Логин: @{user.username}\n"
-        f"Репозиторий: `{GITHUB_OWNER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n"
-        f"Баланс: `{user.balance_active}` GMP"
+async def cmd_profile(
+    msg: Message,
+    repo: Repository,
+    is_admin: bool,
+):
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
     )
-    if is_admin:
-        text += "\n\n💡 _Панель администратора доступна по /admin_"
-        
-    await msg.answer(text, parse_mode="Markdown")
 
-# --- ЗАДАНИЯ ---
+    role = "👑 Администратор" if is_admin else "👤 Пользователь"
+
+    text = (
+        f"👤 <b>Профиль</b>\n\n"
+        f"Статус: {role}\n"
+        f"ID: <code>{user.telegram_id}</code>\n"
+        f"Логин: {safe_username(msg)}\n"
+        f"Баланс: <b>{user.balance_active}</b> GMP\n\n"
+        f"🔗 GitHub: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
+        f"🌿 Ветка: <code>{GITHUB_BRANCH}</code>"
+    )
+
+    if is_admin:
+        text += "\n\n/admin — панель администратора"
+
+    await msg.answer(text, parse_mode="HTML")
+
+
+# -------------------- TASKS ----------------------------------
+
+@dp.message(Command("tasks"))
 @dp.message(F.text == "📋 Задания")
 async def list_tasks(msg: Message, repo: Repository):
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
+
     tasks = await repo.get_available_tasks_for_user(user.id)
+
     if not tasks:
-        await msg.answer("🎉 Вы выполнили все доступные задания!")
+        await msg.answer("🎉 Сейчас нет доступных заданий.")
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔹 {t.title} — {t.reward_gmp} GMP", callback_data=f"view_task:{t.id}")] for t in tasks
-    ])
-    await msg.answer("📋 **Доступные задания:**", reply_markup=kb, parse_mode="Markdown")
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🔹 {task.title} — {task.reward_gmp} GMP",
+                callback_data=f"view_task:{task.id}",
+            )
+        ]
+        for task in tasks
+    ]
+
+    await msg.answer(
+        "📋 <b>Доступные задания:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+
 
 @dp.callback_query(F.data.startswith("view_task:"))
 async def view_task(call: CallbackQuery, repo: Repository):
-    task = await repo.session.get(Task, int(call.data.split(":")[1]))
-    text = f"📋 **{task.title}**\n\n{task.description}\n\nНаграда: {task.reward_gmp} GMP"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="▶️ Выполнить", callback_data=f"start_task:{task.id}")]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    try:
+        task_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    task = await repo.get_task(task_id)
+
+    if task is None or not task.is_active:
+        await call.answer("Задание недоступно.", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="▶️ Выполнить",
+                    callback_data=f"start_task:{task.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ К заданиям",
+                    callback_data="back_tasks",
+                )
+            ],
+        ]
+    )
+
+    await call.message.edit_text(
+        f"📋 <b>{task.title}</b>\n\n"
+        f"{task.description}\n\n"
+        f"💰 Награда: <b>{task.reward_gmp} GMP</b>",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "back_tasks")
+async def back_tasks(call: CallbackQuery, repo: Repository):
+    user = await repo.get_or_create_user(
+        call.from_user.id,
+        call.from_user.username,
+    )
+    tasks = await repo.get_available_tasks_for_user(user.id)
+
+    if not tasks:
+        await call.message.edit_text("🎉 Сейчас нет доступных заданий.")
+        await call.answer()
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🔹 {task.title} — {task.reward_gmp} GMP",
+                callback_data=f"view_task:{task.id}",
+            )
+        ]
+        for task in tasks
+    ]
+
+    await call.message.edit_text(
+        "📋 <b>Доступные задания:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.callback_query(F.data.startswith("start_task:"))
-async def start_task(call: CallbackQuery, state: FSMContext):
-    await state.update_data(current_task_id=int(call.data.split(":")[1]))
+async def start_task(
+    call: CallbackQuery,
+    state: FSMContext,
+    repo: Repository,
+):
+    try:
+        task_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    task = await repo.get_task(task_id)
+
+    if task is None or not task.is_active:
+        await call.answer("Задание недоступно.", show_alert=True)
+        return
+
+    user = await repo.get_or_create_user(
+        call.from_user.id,
+        call.from_user.username,
+    )
+
+    existing = await repo.session.execute(
+        select(TaskSubmission.id).where(
+            and_(
+                TaskSubmission.user_id == user.id,
+                TaskSubmission.task_id == task_id,
+                TaskSubmission.status.in_(
+                    [SubmissionStatus.PENDING, SubmissionStatus.APPROVED]
+                ),
+            )
+        )
+    )
+
+    if existing.scalar_one_or_none() is not None:
+        await call.answer(
+            "Вы уже отправляли это задание.",
+            show_alert=True,
+        )
+        return
+
+    await state.update_data(current_task_id=task_id)
     await state.set_state(TaskSubmissionFSM.waiting_for_proof)
-    await call.message.edit_text("📤 Отправьте **фото** или **текст** с отчетом:")
+
+    await call.message.edit_text(
+        "📤 <b>Отправьте отчёт</b>\n\n"
+        "Можно отправить фото или текст.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.message(TaskSubmissionFSM.waiting_for_proof)
-async def process_proof(msg: Message, state: FSMContext, repo: Repository):
+async def process_proof(
+    msg: Message,
+    state: FSMContext,
+    repo: Repository,
+):
     data = await state.get_data()
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    proof_type = "photo" if msg.photo else "text"
-    proof_data = msg.photo[-1].file_id if msg.photo else msg.text
+    task_id = data.get("current_task_id")
 
-    sub = await repo.create_submission(user.id, data["current_task_id"], proof_type, proof_data)
-    await state.clear()
-    if sub:
-        await msg.answer("⏳ **Отчет успешно отправлен на проверку!**", parse_mode="Markdown")
-    else:
-        await msg.answer("❌ Ошибка при отправке отчета.")
-
-# --- ВЫВОД ---
-@dp.message(F.text == "💸 Вывод GMP")
-async def withdraw_start(msg: Message, repo: Repository, state: FSMContext):
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    min_w = int(await repo.get_setting("min_withdraw", "500"))
-    if user.balance_active < min_w:
-        await msg.answer(f"❌ Минимальный вывод: {min_w} GMP. Ваш баланс: {user.balance_active} GMP.")
+    if not task_id:
+        await state.clear()
+        await msg.answer("❌ Сессия задания потеряна. Откройте задание заново.")
         return
+
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
+
+    if msg.photo:
+        proof_type = "photo"
+        proof_data = msg.photo[-1].file_id
+    elif msg.text:
+        proof_type = "text"
+        proof_data = msg.text.strip()
+    else:
+        await msg.answer("❌ Отправьте фото или текст.")
+        return
+
+    submission = await repo.create_submission(
+        user.id,
+        int(task_id),
+        proof_type,
+        proof_data,
+    )
+
+    await state.clear()
+
+    if submission is None:
+        await msg.answer(
+            "❌ Не удалось отправить отчёт. Возможно, вы уже отправляли это задание."
+        )
+        return
+
+    await msg.answer(
+        f"⏳ <b>Отчёт #{submission.id} отправлен на проверку.</b>\n"
+        "После одобрения GMP автоматически начислятся на баланс.",
+        parse_mode="HTML",
+    )
+
+
+# -------------------- WITHDRAW -------------------------------
+
+@dp.message(Command("withdraw"))
+@dp.message(F.text == "💸 Вывод GMP")
+async def withdraw_start(
+    msg: Message,
+    repo: Repository,
+    state: FSMContext,
+):
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
+
+    min_withdraw = int(
+        await repo.get_setting("min_withdraw", "500")
+    )
+
+    if user.balance_active < min_withdraw:
+        await msg.answer(
+            f"❌ Минимальный вывод: <b>{min_withdraw} GMP</b>\n"
+            f"Ваш баланс: <b>{user.balance_active} GMP</b>",
+            parse_mode="HTML",
+        )
+        return
+
     await state.set_state(WithdrawFSM.waiting_for_amount)
-    await msg.answer("💰 Введите сумму GMP для вывода:")
+
+    await msg.answer(
+        f"💸 Введите сумму GMP для вывода.\n"
+        f"Минимум: <b>{min_withdraw}</b> GMP",
+        parse_mode="HTML",
+    )
+
 
 @dp.message(WithdrawFSM.waiting_for_amount)
-async def withdraw_amount(msg: Message, state: FSMContext):
-    if not msg.text or not msg.text.isdigit():
-        await msg.answer("❌ Введите корректное число.")
+async def withdraw_amount(
+    msg: Message,
+    state: FSMContext,
+):
+    if not msg.text or not msg.text.strip().isdigit():
+        await msg.answer("❌ Введите целое положительное число.")
         return
-    await state.update_data(withdraw_amount=int(msg.text))
+
+    amount = int(msg.text.strip())
+
+    if amount <= 0:
+        await msg.answer("❌ Сумма должна быть больше нуля.")
+        return
+
+    await state.update_data(withdraw_amount=amount)
     await state.set_state(WithdrawFSM.waiting_for_requisites)
-    await msg.answer("💳 Введите ваши реквизиты:")
+
+    await msg.answer(
+        "💳 Теперь отправьте реквизиты для выплаты.\n"
+        "Не отправляйте сюда пароль, код подтверждения или данные аккаунта Telegram."
+    )
+
 
 @dp.message(WithdrawFSM.waiting_for_requisites)
-async def withdraw_reqs(msg: Message, state: FSMContext, repo: Repository):
-    data = await state.get_data()
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    ok, err, wth = await repo.create_withdrawal(user.id, data["withdraw_amount"], msg.text.strip())
-    await state.clear()
-    if ok:
-        await msg.answer(f"✅ Заявка на вывод #{wth.id} успешно создана!")
-    else:
-        await msg.answer(f"❌ Ошибка: {err}")
+async def withdraw_reqs(
+    msg: Message,
+    state: FSMContext,
+    repo: Repository,
+):
+    if not msg.text or not msg.text.strip():
+        await msg.answer("❌ Реквизиты не могут быть пустыми.")
+        return
 
+    data = await state.get_data()
+    amount = int(data.get("withdraw_amount", 0))
+
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
+
+    ok, error, withdrawal = await repo.create_withdrawal(
+        user.id,
+        amount,
+        msg.text,
+    )
+
+    await state.clear()
+
+    if not ok or withdrawal is None:
+        await msg.answer(f"❌ {error}")
+        return
+
+    await msg.answer(
+        f"✅ <b>Заявка #{withdrawal.id} создана.</b>\n"
+        f"Сумма: <b>{withdrawal.amount_gmp} GMP</b>\n"
+        "Ожидайте проверки администратора.",
+        parse_mode="HTML",
+    )
+
+    # Notify all admins about a new withdrawal.
+    for admin_id in ADMIN_IDS:
+        with suppress(Exception):
+            await bot_instance.send_message(
+                admin_id,
+                f"💸 <b>Новая заявка на вывод #{withdrawal.id}</b>\n"
+                f"Пользователь: <code>{user.telegram_id}</code>\n"
+                f"Сумма: <b>{withdrawal.amount_gmp} GMP</b>",
+                parse_mode="HTML",
+            )
+
+
+# -------------------- HISTORY --------------------------------
+
+@dp.message(Command("history"))
 @dp.message(F.text == "📜 История")
 async def history(msg: Message, repo: Repository):
-    user = await repo.get_or_create_user(msg.from_user.id, msg.from_user.username)
-    subs = (await repo.session.execute(select(TaskSubmission).where(TaskSubmission.user_id == user.id).order_by(desc(TaskSubmission.created_at)).limit(5))).scalars().all()
-    text = "📜 **Последние выполненные задания:**\n"
-    for s in subs:
-        text += f"• Задание #{s.task_id}: {s.status.value} (+{s.reward_gmp_snapshot} GMP)\n"
-    await msg.answer(text, parse_mode="Markdown")
+    user = await repo.get_or_create_user(
+        msg.from_user.id,
+        msg.from_user.username,
+    )
 
-# --- АДМИН-ПАНЕЛЬ ---
+    submissions, withdrawals = await repo.get_last_history(user.id)
+
+    lines = ["📜 <b>Последняя история</b>", ""]
+
+    if submissions:
+        lines.append("<b>Задания:</b>")
+        for sub in submissions[:10]:
+            status_map = {
+                SubmissionStatus.PENDING: "⏳ на проверке",
+                SubmissionStatus.APPROVED: "✅ одобрено",
+                SubmissionStatus.REJECTED: "❌ отклонено",
+            }
+            lines.append(
+                f"• #{sub.id} — задание #{sub.task_id} — "
+                f"{status_map.get(sub.status, sub.status.value)} "
+                f"({sub.reward_gmp_snapshot} GMP)"
+            )
+
+    if withdrawals:
+        lines.append("")
+        lines.append("<b>Выводы:</b>")
+        for withdrawal in withdrawals[:10]:
+            status_map = {
+                WithdrawalStatus.PENDING: "⏳ на проверке",
+                WithdrawalStatus.APPROVED: "✅ выплачено",
+                WithdrawalStatus.REJECTED: "❌ отклонено",
+            }
+            lines.append(
+                f"• #{withdrawal.id} — {withdrawal.amount_gmp} GMP — "
+                f"{status_map.get(withdrawal.status, withdrawal.status.value)}"
+            )
+
+    if not submissions and not withdrawals:
+        lines.append("История пока пустая.")
+
+    await msg.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ============================================================
+# 9. ADMIN PANEL
+# ============================================================
+
 @dp.message(Command("admin"))
 async def cmd_admin(msg: Message, is_admin: bool):
-    if is_admin:
-        await msg.answer("👑 **Панель Управления**", reply_markup=admin_main_kb(), parse_mode="Markdown")
+    if not is_admin:
+        return
+
+    await msg.answer(
+        "👑 <b>Панель управления GMP</b>",
+        reply_markup=admin_main_kb(),
+        parse_mode="HTML",
+    )
+
+
+def admin_only(is_admin: bool) -> bool:
+    return is_admin
+
 
 @dp.callback_query(F.data == "admin_stats")
-async def adm_stats(call: CallbackQuery, repo: Repository, is_admin: bool):
-    if not is_admin: return
+async def adm_stats(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
     stats = await repo.get_stats()
-    text = (
-        f"📊 **Статистика Бота:**\n\n"
-        f"🔗 GitHub: `{GITHUB_OWNER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n"
-        f"👥 Пользователей: `{stats['total_users']}`\n"
-        f"📋 Заданий: `{stats['total_tasks']}`\n"
-        f"⏳ На проверке: `{stats['pending_subs']}`\n"
-        f"💸 Заявок на вывод: `{stats['pending_wths']}`"
+
+    await call.message.edit_text(
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{stats['total_users']}</b>\n"
+        f"📋 Заданий: <b>{stats['total_tasks']}</b>\n"
+        f"⏳ На проверке: <b>{stats['pending_subs']}</b>\n"
+        f"💸 Выводов на проверке: <b>{stats['pending_wths']}</b>\n"
+        f"💰 GMP на активных балансах: <b>{stats['total_gmp']}</b>\n\n"
+        f"🔗 GitHub: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
+        f"🌿 Ветка: <code>{GITHUB_BRANCH}</code>",
+        reply_markup=admin_main_kb(),
+        parse_mode="HTML",
     )
-    await call.message.edit_text(text, reply_markup=admin_main_kb(), parse_mode="Markdown")
+    await call.answer()
+
 
 @dp.callback_query(F.data == "admin_settings")
-async def adm_settings_menu(call: CallbackQuery, repo: Repository, is_admin: bool):
-    if not is_admin: return
+async def adm_settings_menu(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
     rate = await repo.get_setting("gmp_rate", "1.00")
-    min_w = await repo.get_setting("min_withdraw", "500")
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить множитель GMP", callback_data="set_rate")],
-        [InlineKeyboardButton(text="✏️ Изменить мин. вывод", callback_data="set_min_w")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
-    ])
-    await call.message.edit_text(
-        f"⚙️ **Настройки бота:**\n\n"
-        f"📈 Коэффициент: {rate}\n"
-        f"🔻 Мин. вывод: {min_w} GMP",
-        reply_markup=kb, parse_mode="Markdown"
+    min_withdraw = await repo.get_setting("min_withdraw", "500")
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить курс",
+                    callback_data="set_rate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить минимум вывода",
+                    callback_data="set_min_w",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад",
+                    callback_data="admin_back",
+                )
+            ],
+        ]
     )
+
+    await call.message.edit_text(
+        f"⚙️ <b>Настройки</b>\n\n"
+        f"📈 Курс: <b>{rate}</b>\n"
+        f"🔻 Минимальный вывод: <b>{min_withdraw} GMP</b>",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.callback_query(F.data == "admin_back")
 async def adm_back(call: CallbackQuery, is_admin: bool):
-    if is_admin:
-        await call.message.edit_text("👑 **Панель Управления**", reply_markup=admin_main_kb(), parse_mode="Markdown")
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        "👑 <b>Панель управления GMP</b>",
+        reply_markup=admin_main_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.callback_query(F.data == "set_rate")
-async def set_rate_start(call: CallbackQuery, state: FSMContext, is_admin: bool):
-    if not is_admin: return
+async def set_rate_start(
+    call: CallbackQuery,
+    state: FSMContext,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
     await state.set_state(AdminSettingsFSM.waiting_for_rate)
-    await call.message.answer("Введите новый коэффициент:")
+    await call.message.answer(
+        "📈 Введите новый курс, например: <code>1.00</code>",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.message(AdminSettingsFSM.waiting_for_rate)
-async def set_rate_finish(msg: Message, state: FSMContext, repo: Repository):
-    await repo.set_setting("gmp_rate", msg.text.strip().replace(',', '.'))
+async def set_rate_finish(
+    msg: Message,
+    state: FSMContext,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await state.clear()
+        return
+
+    try:
+        rate = float((msg.text or "").strip().replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите положительное число, например 1.00.")
+        return
+
+    await repo.set_setting("gmp_rate", f"{rate:.4f}".rstrip("0").rstrip("."))
     await state.clear()
-    await msg.answer("✅ Значение обновлено!")
+    await msg.answer("✅ Курс сохранён.")
+
 
 @dp.callback_query(F.data == "set_min_w")
-async def set_min_w_start(call: CallbackQuery, state: FSMContext, is_admin: bool):
-    if not is_admin: return
+async def set_min_w_start(
+    call: CallbackQuery,
+    state: FSMContext,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
     await state.set_state(AdminSettingsFSM.waiting_for_min_withdraw)
-    await call.message.answer("Введите мин. вывод в GMP:")
+    await call.message.answer("🔻 Введите новый минимум вывода в GMP:")
+    await call.answer()
+
 
 @dp.message(AdminSettingsFSM.waiting_for_min_withdraw)
-async def set_min_w_finish(msg: Message, state: FSMContext, repo: Repository):
-    await repo.set_setting("min_withdraw", msg.text.strip())
+async def set_min_w_finish(
+    msg: Message,
+    state: FSMContext,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await state.clear()
+        return
+
+    try:
+        minimum = int((msg.text or "").strip())
+        if minimum <= 0:
+            raise ValueError
+    except ValueError:
+        await msg.answer("❌ Введите положительное целое число.")
+        return
+
+    await repo.set_setting("min_withdraw", str(minimum))
     await state.clear()
-    await msg.answer("✅ Мин. вывод обновлен!")
+    await msg.answer("✅ Минимальный вывод сохранён.")
+
+
+# -------------------- CREATE TASK ----------------------------
 
 @dp.callback_query(F.data == "admin_add_task")
-async def adm_add_task(call: CallbackQuery, state: FSMContext, is_admin: bool):
-    if not is_admin: return
+async def adm_add_task(
+    call: CallbackQuery,
+    state: FSMContext,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
     await state.set_state(CreateTaskFSM.title)
-    await call.message.answer("Введите название задания:")
+    await call.message.answer("➕ Введите название задания:")
+    await call.answer()
+
 
 @dp.message(CreateTaskFSM.title)
-async def adm_t1(msg: Message, state: FSMContext):
-    await state.update_data(title=msg.text)
+async def adm_t1(
+    msg: Message,
+    state: FSMContext,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await state.clear()
+        return
+
+    title = (msg.text or "").strip()
+
+    if not title:
+        await msg.answer("❌ Название не может быть пустым.")
+        return
+
+    await state.update_data(title=title[:255])
     await state.set_state(CreateTaskFSM.description)
-    await msg.answer("Введите описание задания:")
+    await msg.answer("📝 Введите описание задания:")
+
 
 @dp.message(CreateTaskFSM.description)
-async def adm_t2(msg: Message, state: FSMContext):
-    await state.update_data(desc=msg.text)
+async def adm_t2(
+    msg: Message,
+    state: FSMContext,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await state.clear()
+        return
+
+    description = (msg.text or "").strip()
+
+    if not description:
+        await msg.answer("❌ Описание не может быть пустым.")
+        return
+
+    await state.update_data(description=description)
     await state.set_state(CreateTaskFSM.reward)
-    await msg.answer("Введите сумму награды в GMP:")
+    await msg.answer("💰 Введите награду в GMP:")
+
 
 @dp.message(CreateTaskFSM.reward)
-async def adm_t3(msg: Message, state: FSMContext, repo: Repository):
+async def adm_t3(
+    msg: Message,
+    state: FSMContext,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await state.clear()
+        return
+
+    try:
+        reward = int((msg.text or "").strip())
+        if reward <= 0:
+            raise ValueError
+    except ValueError:
+        await msg.answer("❌ Награда должна быть положительным целым числом.")
+        return
+
     data = await state.get_data()
-    task = Task(title=data["title"], description=data["desc"], reward_gmp=int(msg.text))
-    repo.session.add(task)
-    await repo.session.commit()
+
+    task = Task(
+        title=data["title"],
+        description=data["description"],
+        reward_gmp=reward,
+        is_active=True,
+    )
+
+    try:
+        repo.session.add(task)
+        await repo.session.commit()
+        await repo.session.refresh(task)
+    except Exception:
+        await repo.session.rollback()
+        raise
+
     await state.clear()
-    await msg.answer("✅ Задание добавлено!")
+
+    await msg.answer(
+        f"✅ Задание <b>#{task.id}</b> создано.\n"
+        f"Награда: <b>{reward} GMP</b>",
+        parse_mode="HTML",
+    )
+
+
+# -------------------- CHECK SUBMISSIONS ----------------------
+
+async def show_next_submission(
+    message: Message,
+    repo: Repository,
+) -> None:
+    result = await repo.session.execute(
+        select(TaskSubmission)
+        .where(TaskSubmission.status == SubmissionStatus.PENDING)
+        .order_by(TaskSubmission.id.asc())
+        .limit(1)
+    )
+    submission = result.scalar_one_or_none()
+
+    if submission is None:
+        await message.answer("🎉 Все отчёты проверены!")
+        return
+
+    text = (
+        f"📝 <b>Заявка #{submission.id}</b>\n"
+        f"👤 Пользователь ID: <code>{submission.user.telegram_id}</code>\n"
+        f"📋 Задание: <code>#{submission.task_id}</code>\n"
+        f"💰 Награда: <b>{submission.reward_gmp_snapshot} GMP</b>\n"
+        f"📎 Тип отчёта: <b>{submission.proof_type}</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=f"app_s:{submission.id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"rej_s:{submission.id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data="admin_check_tasks",
+                ),
+            ],
+        ]
+    )
+
+    if submission.proof_type == "photo":
+        await message.answer_photo(
+            submission.proof_data,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"{text}\n\n"
+            f"📄 <b>Отчёт:</b>\n{submission.proof_data}",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
 
 @dp.callback_query(F.data == "admin_check_tasks")
-async def adm_check_t(call: CallbackQuery, repo: Repository, is_admin: bool):
-    if not is_admin: return
-    sub = (await repo.session.execute(select(TaskSubmission).where(TaskSubmission.status == SubmissionStatus.PENDING).limit(1))).scalar_one_or_none()
-    if not sub:
-        await call.message.edit_text("🎉 Все отчеты проверены!")
+async def adm_check_t(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
         return
 
-    text = f"📝 **Заявка #{sub.id}**\nНаграда: {sub.reward_gmp_snapshot} GMP"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"app_s:{sub.id}")
-    ]])
-    if sub.proof_type == "photo":
-        await call.message.delete()
-        await call.message.answer_photo(sub.proof_data, caption=text, reply_markup=kb, parse_mode="Markdown")
-    else:
-        await call.message.edit_text(f"{text}\nОтчет: {sub.proof_data}", reply_markup=kb, parse_mode="Markdown")
+    await show_next_submission(call.message, repo)
+    await call.answer()
+
 
 @dp.callback_query(F.data.startswith("app_s:"))
-async def adm_app_sub(call: CallbackQuery, repo: Repository, bot: Bot):
-    ok, msg, sub = await repo.approve_submission(int(call.data.split(":")[1]))
-    if ok:
-        user = await repo.session.get(User, sub.user_id)
-        await bot.send_message(user.telegram_id, f"✅ Ваш отчет одобрен! Начислено {sub.reward_gmp_snapshot} GMP.")
-    await call.answer(msg)
+async def adm_app_sub(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+    bot: Bot,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        submission_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    ok, text, submission = await repo.approve_submission(submission_id)
+
+    if not ok or submission is None:
+        await call.answer(text, show_alert=True)
+        return
+
+    user = await repo.session.get(User, submission.user_id)
+
+    if user:
+        with suppress(Exception):
+            await bot.send_message(
+                user.telegram_id,
+                f"✅ <b>Ваш отчёт #{submission.id} одобрен!</b>\n"
+                f"Начислено: <b>{submission.reward_gmp_snapshot} GMP</b>",
+                parse_mode="HTML",
+            )
+
+    await call.answer("✅ Одобрено.")
+
+    with suppress(TelegramBadRequest):
+        await call.message.delete()
+
+
+@dp.callback_query(F.data.startswith("rej_s:"))
+async def adm_rej_sub(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+    bot: Bot,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        submission_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    ok, text, submission = await repo.reject_submission(submission_id)
+
+    if not ok or submission is None:
+        await call.answer(text, show_alert=True)
+        return
+
+    user = await repo.session.get(User, submission.user_id)
+
+    if user:
+        with suppress(Exception):
+            await bot.send_message(
+                user.telegram_id,
+                f"❌ <b>Ваш отчёт #{submission.id} отклонён.</b>\n"
+                "GMP за это задание не начислены.",
+                parse_mode="HTML",
+            )
+
+    await call.answer("❌ Отклонено.")
+
+    with suppress(TelegramBadRequest):
+        await call.message.delete()
+
+
+# -------------------- WITHDRAWAL ADMIN -----------------------
 
 @dp.callback_query(F.data == "admin_withdraws_menu")
-async def adm_wth_menu(call: CallbackQuery, repo: Repository, is_admin: bool):
-    if not is_admin: return
-    wth = (await repo.session.execute(select(Withdrawal).where(Withdrawal.status == WithdrawalStatus.PENDING).limit(1))).scalar_one_or_none()
-    if not wth:
-        await call.message.edit_text("🎉 Все заявки на вывод обработаны!")
+async def adm_wth_menu(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
         return
-    text = f"💸 **Вывод #{wth.id}**\nСумма: {wth.amount_gmp} GMP\nРеквизиты: `{wth.requisites}`"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Подтвердить выплату", callback_data=f"app_w:{wth.id}")
-    ]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+    result = await repo.session.execute(
+        select(Withdrawal)
+        .where(Withdrawal.status == WithdrawalStatus.PENDING)
+        .order_by(Withdrawal.id.asc())
+        .limit(1)
+    )
+    withdrawal = result.scalar_one_or_none()
+
+    if withdrawal is None:
+        await call.message.edit_text(
+            "🎉 Все заявки на вывод обработаны.",
+            reply_markup=admin_main_kb(),
+        )
+        await call.answer()
+        return
+
+    user = await repo.session.get(User, withdrawal.user_id)
+
+    text = (
+        f"💸 <b>Заявка на вывод #{withdrawal.id}</b>\n\n"
+        f"👤 Пользователь: "
+        f"<code>{user.telegram_id if user else 'не найден'}</code>\n"
+        f"💰 Сумма: <b>{withdrawal.amount_gmp} GMP</b>\n"
+        f"💵 По курсу: <b>{withdrawal.amount_money}</b>\n"
+        f"💳 Реквизиты: <code>{withdrawal.requisites}</code>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить выплату",
+                    callback_data=f"app_w:{withdrawal.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить и вернуть GMP",
+                    callback_data=f"rej_w:{withdrawal.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Следующая",
+                    callback_data="admin_withdraws_menu",
+                )
+            ],
+        ]
+    )
+
+    await call.message.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await call.answer()
+
 
 @dp.callback_query(F.data.startswith("app_w:"))
-async def adm_app_wth(call: CallbackQuery, repo: Repository, bot: Bot):
-    ok, msg, wth = await repo.approve_withdrawal(int(call.data.split(":")[1]))
-    if ok:
-        user = await repo.session.get(User, wth.user_id)
-        await bot.send_message(user.telegram_id, f"✅ Вывод #{wth.id} на сумму {wth.amount_gmp} GMP выполнен!")
-    await call.answer(msg)
+async def adm_app_wth(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+    bot: Bot,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
 
-# =====================================================================
-# 🏁 8. ЗАПУСК WEB SERVICE ДЛЯ RENDER
-# =====================================================================
-async def health_check(request):
-    return web.Response(text="GMP Bot Web Service is Running!", status=200)
+    try:
+        withdrawal_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
 
-async def main():
-    await init_db()
-    bot = Bot(token=BOT_TOKEN)
-    dp.update.middleware(DbSessionMiddleware())
+    ok, text, withdrawal = await repo.approve_withdrawal(withdrawal_id)
 
-    # Фоновые процессы
-    asyncio.create_task(auto_ring_loop(bot))
-    asyncio.create_task(periodic_cleanup_loop())
+    if not ok or withdrawal is None:
+        await call.answer(text, show_alert=True)
+        return
 
-    # Настройка HTTP-сервера для Render
+    user = await repo.session.get(User, withdrawal.user_id)
+
+    if user:
+        with suppress(Exception):
+            await bot.send_message(
+                user.telegram_id,
+                f"✅ <b>Вывод #{withdrawal.id} подтверждён!</b>\n"
+                f"Сумма: <b>{withdrawal.amount_gmp} GMP</b>",
+                parse_mode="HTML",
+            )
+
+    await call.answer("✅ Выплата подтверждена.")
+    await adm_wth_menu(call, repo, is_admin)
+
+
+@dp.callback_query(F.data.startswith("rej_w:"))
+async def adm_rej_wth(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+    bot: Bot,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        withdrawal_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    ok, text, withdrawal = await repo.reject_withdrawal(withdrawal_id)
+
+    if not ok or withdrawal is None:
+        await call.answer(text, show_alert=True)
+        return
+
+    user = await repo.session.get(User, withdrawal.user_id)
+
+    if user:
+        with suppress(Exception):
+            await bot.send_message(
+                user.telegram_id,
+                f"❌ <b>Вывод #{withdrawal.id} отклонён.</b>\n"
+                f"↩️ Возвращено: <b>{withdrawal.amount_gmp} GMP</b>",
+                parse_mode="HTML",
+            )
+
+    await call.answer("❌ Отклонено, GMP возвращены.")
+    await adm_wth_menu(call, repo, is_admin)
+
+
+# ============================================================
+# 10. RENDER HEALTH SERVER
+# ============================================================
+
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(
+        text="GMP Bot is running",
+        status=200,
+        content_type="text/plain",
+    )
+
+
+async def start_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", health_check)
-    app_runner = web.AppRunner(app)
-    await app_runner.setup()
-    
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(app_runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"🌐 Веб-сервер запущен на порту {port}")
+    app.router.add_get("/health", health_check)
 
-    await dp.start_polling(bot)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info("Render HTTP server started on port %s", port)
+    return runner
+
+
+# Global bot reference is only used for admin notifications from handlers
+# where a Bot object is not part of the handler signature.
+bot_instance: Optional[Bot] = None
+
+
+# ============================================================
+# 11. MAIN
+# ============================================================
+
+async def main() -> None:
+    global bot_instance
+
+    await init_db()
+
+    bot_instance = Bot(token=BOT_TOKEN)
+
+    # DB session is opened separately for every update.
+    dp.update.middleware(DbSessionMiddleware())
+
+    runner = await start_web_server()
+
+    try:
+        me = await bot_instance.get_me()
+        logger.info(
+            "Bot started: @%s | admins=%s | DB=%s",
+            me.username,
+            ADMIN_IDS,
+            "PostgreSQL" if DATABASE_URL.startswith("postgresql+") else "SQLite",
+        )
+
+        # Remove old webhook before polling.
+        await bot_instance.delete_webhook(drop_pending_updates=False)
+
+        await dp.start_polling(
+            bot_instance,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+
+    finally:
+        with suppress(Exception):
+            await runner.cleanup()
+
+        with suppress(Exception):
+            await bot_instance.session.close()
+
+        with suppress(Exception):
+            await engine.dispose()
+
+        bot_instance = None
+        logger.info("GMP Bot stopped.")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user.")
