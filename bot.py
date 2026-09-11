@@ -40,7 +40,7 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -57,8 +57,6 @@ ADMIN_IDS = [
     if x.strip().isdigit()
 ]
 
-# GitHub variables are kept for information/diagnostics.
-# IMPORTANT: GitHub is NOT used as the database.
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Gmpzaggf")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "GMP-")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
@@ -72,8 +70,6 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# SQLite is useful locally, but Render's filesystem is ephemeral.
-# Therefore production MUST use Render PostgreSQL.
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///./gmp_bot.db"
     logging.warning(
@@ -177,7 +173,7 @@ class TaskSubmission(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="submissions")
-    task: Mapped["Task"] = relationship(back_populates="submissions")
+    task: Mapped["Task"] = relationship(back_populates="task")
 
 
 class Withdrawal(Base):
@@ -211,7 +207,7 @@ class Setting(Base):
 
 
 # ============================================================
-# 3. DATABASE ENGINE
+# 3. DATABASE ENGINE & GITHUB BACKUP
 # ============================================================
 
 engine_kwargs = {
@@ -219,7 +215,6 @@ engine_kwargs = {
     "pool_pre_ping": True,
 }
 
-# PostgreSQL connection pool. SQLite does not support these pool args.
 if DATABASE_URL.startswith("postgresql+asyncpg://"):
     engine_kwargs.update(
         {
@@ -240,15 +235,6 @@ SessionLocal = async_sessionmaker(
 
 
 class GitHubPersistence:
-    """
-    GitHub JSON backup/restore.
-
-    The token stays in Render Environment Variables. The JSON file is stored
-    in the repository and is updated after every successful DB commit.
-    This is a backup layer; Render PostgreSQL is still the recommended
-    primary database for production.
-    """
-
     def __init__(self) -> None:
         self.owner = GITHUB_OWNER
         self.repo = GITHUB_REPO
@@ -298,7 +284,6 @@ class GitHubPersistence:
 
     async def load_snapshot(self) -> Optional[dict]:
         if not self.enabled:
-            logger.warning("GitHub persistence disabled: GITHUB_TOKEN is missing.")
             return None
 
         import aiohttp
@@ -314,13 +299,11 @@ class GitHubPersistence:
 
     async def save_snapshot(self, session: AsyncSession) -> bool:
         if not self.enabled:
-            logger.warning("GitHub persistence disabled: GITHUB_TOKEN is missing.")
             return False
 
         import aiohttp
 
         async with self._lock:
-            # Read all data from the committed database state.
             users = (await session.execute(select(User))).scalars().all()
             tasks = (await session.execute(select(Task))).scalars().all()
             submissions = (
@@ -398,7 +381,6 @@ class GitHubPersistence:
             for attempt in range(1, 4):
                 try:
                     async with aiohttp.ClientSession(timeout=timeout) as http:
-                        # Always fetch the latest SHA immediately before PUT.
                         _, sha = await self._get_file(http)
 
                         body = {
@@ -415,15 +397,7 @@ class GitHubPersistence:
                             json=body,
                         ) as response:
                             if response.status in (200, 201):
-                                logger.info(
-                                    "GitHub data saved: %s users, %s tasks, %s submissions, %s withdrawals",
-                                    len(users),
-                                    len(tasks),
-                                    len(submissions),
-                                    len(withdrawals),
-                                )
                                 return True
-
                             response_body = await response.text()
                             last_error = RuntimeError(
                                 f"GitHub PUT failed: HTTP {response.status}: {response_body[:300]}"
@@ -441,7 +415,6 @@ github_persistence = GitHubPersistence()
 
 
 async def restore_from_github(session: AsyncSession) -> bool:
-    """Restore the GitHub snapshot only when the local DB has no application data."""
     counts = {
         "users": (await session.execute(select(func.count(User.id)))).scalar_one(),
         "tasks": (await session.execute(select(func.count(Task.id)))).scalar_one(),
@@ -461,7 +434,6 @@ async def restore_from_github(session: AsyncSession) -> bool:
         return False
 
     try:
-        # Insert in dependency order.
         for item in snapshot.get("users", []):
             session.add(
                 User(
@@ -521,7 +493,7 @@ async def restore_from_github(session: AsyncSession) -> bool:
         return True
     except Exception:
         await session.rollback()
-        logger.exception("GitHub restore failed; database was rolled back.")
+        logger.exception("GitHub restore failed.")
         return False
 
 
@@ -541,18 +513,11 @@ async def init_db() -> None:
 
             await session.commit()
 
-            # If GitHub had no snapshot, create the first one now.
             if not restored:
                 await github_persistence.save_snapshot(session)
         except Exception:
             await session.rollback()
             raise
-
-    logger.info(
-        "Database initialized: %s | GitHub persistence: %s",
-        DATABASE_URL.split("@")[-1],
-        "ON" if github_persistence.enabled else "OFF",
-    )
 
 
 # ============================================================
@@ -564,7 +529,6 @@ class Repository:
         self.session = session
 
     async def commit(self) -> None:
-        """Commit DB changes and immediately mirror the new state to GitHub."""
         await self.session.commit()
         await github_persistence.save_snapshot(self.session)
 
@@ -698,7 +662,6 @@ class Repository:
                 await self.session.rollback()
                 return None
 
-            # Prevent duplicate pending/approved submissions.
             existing = await self.session.execute(
                 select(TaskSubmission.id).where(
                     and_(
@@ -935,7 +898,6 @@ class Repository:
                 await self.session.rollback()
                 return False, "Пользователь не найден.", None
 
-            # Return locked GMP to the active balance.
             user.balance_locked = max(
                 0, user.balance_locked - withdrawal.amount_gmp
             )
@@ -1088,15 +1050,39 @@ def admin_main_kb() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# 8. BOT / DISPATCHER
+# 8. BOT / DISPATCHER & ADMIN NOTIFICATION HELPER
 # ============================================================
 
 dp = Dispatcher(storage=MemoryStorage())
+bot_instance: Optional[Bot] = None
 
 
 def safe_username(message: Message) -> str:
     username = message.from_user.username
     return f"@{username}" if username else "не указан"
+
+
+async def notify_admins(text: str, photo_id: Optional[str] = None, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    """Отправляет уведомления всем администраторам."""
+    if not bot_instance:
+        return
+    for admin_id in ADMIN_IDS:
+        with suppress(Exception):
+            if photo_id:
+                await bot_instance.send_photo(
+                    admin_id,
+                    photo=photo_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+            else:
+                await bot_instance.send_message(
+                    admin_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
 
 
 # -------------------- START / HELP ---------------------------
@@ -1387,6 +1373,36 @@ async def process_proof(
         parse_mode="HTML",
     )
 
+    # Отправка уведомления администраторам о новом отчёте по заданию
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=f"app_s:{submission.id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"rej_s:{submission.id}",
+                ),
+            ]
+        ]
+    )
+
+    caption = (
+        f"📥 <b>Новый отчёт #{submission.id} на проверку!</b>\n"
+        f"👤 Пользователь: <code>{user.telegram_id}</code> (@{user.username or 'нет'})\n"
+        f"📋 Задание: <code>#{submission.task_id}</code>\n"
+        f"💰 Награда: <b>{submission.reward_gmp_snapshot} GMP</b>\n"
+        f"📎 Тип отчёта: <b>{proof_type}</b>"
+    )
+
+    if proof_type == "photo":
+        await notify_admins(caption, photo_id=proof_data, reply_markup=admin_kb)
+    else:
+        full_text = f"{caption}\n\n📄 <b>Текст отчёта:</b>\n{proof_data}"
+        await notify_admins(full_text, reply_markup=admin_kb)
+
 
 # -------------------- WITHDRAW -------------------------------
 
@@ -1484,16 +1500,32 @@ async def withdraw_reqs(
         parse_mode="HTML",
     )
 
-    # Notify all admins about a new withdrawal.
-    for admin_id in ADMIN_IDS:
-        with suppress(Exception):
-            await bot_instance.send_message(
-                admin_id,
-                f"💸 <b>Новая заявка на вывод #{withdrawal.id}</b>\n"
-                f"Пользователь: <code>{user.telegram_id}</code>\n"
-                f"Сумма: <b>{withdrawal.amount_gmp} GMP</b>",
-                parse_mode="HTML",
-            )
+    # Уведомление администраторов о заявке на вывод
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить выплату",
+                    callback_data=f"app_w:{withdrawal.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"rej_w:{withdrawal.id}",
+                )
+            ]
+        ]
+    )
+
+    text_admin = (
+        f"💸 <b>Новая заявка на вывод #{withdrawal.id}</b>\n\n"
+        f"👤 Пользователь: <code>{user.telegram_id}</code> (@{user.username or 'нет'})\n"
+        f"💰 Сумма: <b>{withdrawal.amount_gmp} GMP</b> (К выплате: {withdrawal.amount_money})\n"
+        f"💳 Реквизиты: <code>{withdrawal.requisites}</code>"
+    )
+
+    await notify_admins(text_admin, reply_markup=admin_kb)
 
 
 # -------------------- HISTORY --------------------------------
@@ -1959,8 +1991,6 @@ async def delete_task(
             await adm_manage_tasks(call, repo, is_admin)
             return
 
-        # First remove submissions so foreign-key constraints cannot block
-        # deletion of the task.
         await repo.session.execute(
             TaskSubmission.__table__.delete().where(
                 TaskSubmission.task_id == task_id
@@ -2000,9 +2030,12 @@ async def show_next_submission(
         await message.answer("🎉 Все отчёты проверены!")
         return
 
+    user = await repo.session.get(User, submission.user_id)
+    user_info = f"<code>{user.telegram_id}</code> (@{user.username or 'нет'})" if user else "Не найден"
+
     text = (
         f"📝 <b>Заявка #{submission.id}</b>\n"
-        f"👤 Пользователь ID: <code>{submission.user.telegram_id}</code>\n"
+        f"👤 Пользователь: {user_info}\n"
         f"📋 Задание: <code>#{submission.task_id}</code>\n"
         f"💰 Награда: <b>{submission.reward_gmp_snapshot} GMP</b>\n"
         f"📎 Тип отчёта: <b>{submission.proof_type}</b>"
@@ -2171,8 +2204,7 @@ async def adm_wth_menu(
 
     text = (
         f"💸 <b>Заявка на вывод #{withdrawal.id}</b>\n\n"
-        f"👤 Пользователь: "
-        f"<code>{user.telegram_id if user else 'не найден'}</code>\n"
+        f"👤 Пользователь: <code>{user.telegram_id if user else 'не найден'}</code> (@{user.username if user else 'нет'})\n"
         f"💰 Сумма: <b>{withdrawal.amount_gmp} GMP</b>\n"
         f"💵 По курсу: <b>{withdrawal.amount_money}</b>\n"
         f"💳 Реквизиты: <code>{withdrawal.requisites}</code>"
@@ -2244,7 +2276,8 @@ async def adm_app_wth(
             )
 
     await call.answer("✅ Выплата подтверждена.")
-    await adm_wth_menu(call, repo, is_admin)
+    with suppress(TelegramBadRequest):
+        await call.message.delete()
 
 
 @dp.callback_query(F.data.startswith("rej_w:"))
@@ -2282,7 +2315,8 @@ async def adm_rej_wth(
             )
 
     await call.answer("❌ Отклонено, GMP возвращены.")
-    await adm_wth_menu(call, repo, is_admin)
+    with suppress(TelegramBadRequest):
+        await call.message.delete()
 
 
 # ============================================================
@@ -2313,11 +2347,6 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 
-# Global bot reference is only used for admin notifications from handlers
-# where a Bot object is not part of the handler signature.
-bot_instance: Optional[Bot] = None
-
-
 # ============================================================
 # 11. MAIN
 # ============================================================
@@ -2329,7 +2358,6 @@ async def main() -> None:
 
     bot_instance = Bot(token=BOT_TOKEN)
 
-    # DB session is opened separately for every update.
     dp.update.middleware(DbSessionMiddleware())
 
     runner = await start_web_server()
@@ -2343,7 +2371,6 @@ async def main() -> None:
             "PostgreSQL" if DATABASE_URL.startswith("postgresql+") else "SQLite",
         )
 
-        # Remove old webhook before polling.
         await bot_instance.delete_webhook(drop_pending_updates=False)
 
         await dp.start_polling(
