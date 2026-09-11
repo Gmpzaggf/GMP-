@@ -6,7 +6,7 @@ import base64
 import json
 from urllib.parse import quote
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Sequence, Tuple
 
 from aiohttp import web
@@ -173,7 +173,7 @@ class TaskSubmission(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="submissions")
-    task: Mapped["Task"] = relationship(back_populates="task")
+    task: Mapped["Task"] = relationship(back_populates="submissions")
 
 
 class Withdrawal(Base):
@@ -314,9 +314,31 @@ class GitHubPersistence:
             ).scalars().all()
             settings = (await session.execute(select(Setting))).scalars().all()
 
+            now = datetime.utcnow()
+            cleaned_submissions = []
+            for x in submissions:
+                # Очищаем устаревшие медиа-ссылки отработанных отчётов, чтобы файл GitHub не распухал
+                p_data = x.proof_data
+                if x.status != SubmissionStatus.PENDING and x.proof_type == "photo":
+                    if (now - x.created_at) > timedelta(days=3):
+                        p_data = "[photo_purged]"
+
+                cleaned_submissions.append(
+                    {
+                        "id": x.id,
+                        "user_id": x.user_id,
+                        "task_id": x.task_id,
+                        "reward_gmp_snapshot": x.reward_gmp_snapshot,
+                        "status": x.status.value,
+                        "proof_type": x.proof_type,
+                        "proof_data": p_data,
+                        "created_at": x.created_at.isoformat(),
+                    }
+                )
+
             snapshot = {
                 "version": 2,
-                "saved_at": datetime.utcnow().isoformat(),
+                "saved_at": now.isoformat(),
                 "users": [
                     {
                         "id": u.id,
@@ -339,19 +361,7 @@ class GitHubPersistence:
                     }
                     for t in tasks
                 ],
-                "submissions": [
-                    {
-                        "id": x.id,
-                        "user_id": x.user_id,
-                        "task_id": x.task_id,
-                        "reward_gmp_snapshot": x.reward_gmp_snapshot,
-                        "status": x.status.value,
-                        "proof_type": x.proof_type,
-                        "proof_data": x.proof_data,
-                        "created_at": x.created_at.isoformat(),
-                    }
-                    for x in submissions
-                ],
+                "submissions": cleaned_submissions,
                 "withdrawals": [
                     {
                         "id": w.id,
@@ -384,7 +394,7 @@ class GitHubPersistence:
                         _, sha = await self._get_file(http)
 
                         body = {
-                            "message": "chore: save GMP bot data",
+                            "message": "chore: sync state to GitHub data",
                             "content": encoded,
                             "branch": self.branch,
                         }
@@ -1373,7 +1383,6 @@ async def process_proof(
         parse_mode="HTML",
     )
 
-    # Отправка уведомления администраторам о новом отчёте по заданию
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1500,7 +1509,6 @@ async def withdraw_reqs(
         parse_mode="HTML",
     )
 
-    # Уведомление администраторов о заявке на вывод
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1998,6 +2006,9 @@ async def delete_task(
         )
         await repo.session.delete(task)
         await repo.session.commit()
+        
+        # Моментально заливаем изменения в GitHub JSON, чтобы задание сразу исчезло оттуда
+        await github_persistence.save_snapshot(repo.session)
 
     except Exception:
         await repo.session.rollback()
