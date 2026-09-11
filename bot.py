@@ -1067,6 +1067,12 @@ def admin_main_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🗑 Управление заданиями",
+                    callback_data="admin_manage_tasks",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📝 Проверка заданий",
                     callback_data="admin_check_tasks",
                 )
@@ -1828,6 +1834,152 @@ async def adm_t3(
         f"Награда: <b>{reward} GMP</b>",
         parse_mode="HTML",
     )
+
+
+# -------------------- TASK MANAGEMENT ------------------------
+
+@dp.callback_query(F.data == "admin_manage_tasks")
+async def adm_manage_tasks(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    result = await repo.session.execute(
+        select(Task).order_by(Task.id.desc())
+    )
+    tasks = result.scalars().all()
+
+    if not tasks:
+        await call.message.edit_text(
+            "📋 Заданий пока нет.",
+            reply_markup=admin_main_kb(),
+        )
+        await call.answer()
+        return
+
+    rows = []
+    for task in tasks:
+        status = "🟢" if task.is_active else "🔴"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{status} #{task.id} {task.title} — {task.reward_gmp} GMP",
+                callback_data=f"delete_task_confirm:{task.id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data="admin_back",
+        )
+    ])
+
+    await call.message.edit_text(
+        "🗑 <b>Удаление заданий</b>\n\n"
+        "Нажмите на задание, которое хотите удалить:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_task_confirm:"))
+async def delete_task_confirm(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        task_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    task = await repo.get_task(task_id)
+    if task is None:
+        await call.answer("Задание уже удалено.", show_alert=True)
+        await adm_manage_tasks(call, repo, is_admin)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Да, удалить",
+                    callback_data=f"delete_task:{task_id}",
+                ),
+                InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data="admin_manage_tasks",
+                ),
+            ]
+        ]
+    )
+
+    await call.message.edit_text(
+        f"⚠️ <b>Удалить задание?</b>\n\n"
+        f"ID: <b>#{task.id}</b>\n"
+        f"Название: <b>{task.title}</b>\n"
+        f"Награда: <b>{task.reward_gmp} GMP</b>\n\n"
+        "Все заявки по этому заданию также будут удалены.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_task:"))
+async def delete_task(
+    call: CallbackQuery,
+    repo: Repository,
+    is_admin: bool,
+):
+    if not admin_only(is_admin):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        task_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    try:
+        task = await repo.get_task(task_id)
+        if task is None:
+            await call.answer("Задание уже удалено.", show_alert=True)
+            await adm_manage_tasks(call, repo, is_admin)
+            return
+
+        # First remove submissions so foreign-key constraints cannot block
+        # deletion of the task.
+        await repo.session.execute(
+            TaskSubmission.__table__.delete().where(
+                TaskSubmission.task_id == task_id
+            )
+        )
+        await repo.session.delete(task)
+        await repo.session.commit()
+
+    except Exception:
+        await repo.session.rollback()
+        logger.exception("Failed to delete task #%s", task_id)
+        await call.answer(
+            "Не удалось удалить задание. Изменения отменены.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer(f"🗑 Задание #{task_id} удалено.")
+    await adm_manage_tasks(call, repo, is_admin)
 
 
 # -------------------- CHECK SUBMISSIONS ----------------------
