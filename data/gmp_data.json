@@ -1,0 +1,18 @@
+{
+  "saved_at": "2026-09-11T17:54:41.640060",
+  "settings": [
+    {
+      "key": "gmp_rate",
+      "value": "1.00"
+    },
+    {
+      "key": "min_withdraw",
+      "value": "500"
+    }
+  ],
+  "submissions": [],
+  "tasks": [],
+  "users": [],
+  "version": 2,
+  "withdrawals": []
+}
