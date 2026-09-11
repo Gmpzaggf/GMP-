@@ -1,5 +1,5 @@
 {
-  "saved_at": "2026-09-11T17:55:27.685649",
+  "saved_at": "2026-09-11T17:59:24.904841",
   "settings": [
     {
       "key": "gmp_rate",
@@ -7,7 +7,7 @@
     },
     {
       "key": "min_withdraw",
-      "value": "500"
+      "value": "1"
     }
   ],
   "submissions": [],
