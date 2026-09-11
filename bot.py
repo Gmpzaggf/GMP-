@@ -1165,8 +1165,6 @@ async def cmd_profile(
         f"ID: <code>{user.telegram_id}</code>\n"
         f"Логин: {safe_username(msg)}\n"
         f"Баланс: <b>{user.balance_active}</b> GMP\n\n"
-        f"🔗 GitHub: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
-        f"🌿 Ветка: <code>{GITHUB_BRANCH}</code>"
     )
 
     if is_admin:
